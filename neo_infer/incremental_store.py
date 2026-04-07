@@ -48,14 +48,22 @@ class IncrementalStore:
 
         self._client.run_write(
             """
-            UNWIND $events AS event
+            MERGE (counter:IdSequence {name: 'ChangeLog'})
+            ON CREATE SET counter.next_seq = 1
+            WITH counter, $events AS events
+            WITH counter, events, toInteger(counter.next_seq) AS start_seq
+            UNWIND range(0, size(events) - 1) AS idx
+            WITH counter, events[idx] AS event, start_seq + idx AS seq, idx
             CREATE (c:ChangeLog {
+              change_seq: seq,
               event_type: event.event_type,
               src: event.src,
               rel: event.rel,
               dst: event.dst,
               created_at: coalesce(event.created_at, datetime())
             })
+            WITH counter, start_seq, max(seq) AS last_seq
+            SET counter.next_seq = coalesce(last_seq, start_seq - 1) + 1
             """,
             {"events": payload},
         )
@@ -93,8 +101,8 @@ class IncrementalStore:
         rows = self._client.run_read(
             """
             MATCH (c:ChangeLog)
-            WHERE id(c) > $cursor
-            RETURN id(c) AS change_id,
+            WHERE toInteger(coalesce(c.change_seq, 0)) > $cursor
+            RETURN toInteger(coalesce(c.change_seq, 0)) AS change_id,
                    c.event_type AS event_type,
                    c.src AS src,
                    c.rel AS rel,
@@ -137,14 +145,14 @@ class IncrementalStore:
         rows = self._client.run_read(
             """
             MATCH (c:ChangeLog)
-            WHERE id(c) > $cursor
-            RETURN toString(id(c)) AS change_id,
+            WHERE toInteger(coalesce(c.change_seq, 0)) > $cursor
+            RETURN toString(toInteger(coalesce(c.change_seq, 0))) AS change_id,
                    c.event_type AS op,
                    c.src AS src_id,
                    c.rel AS relation,
                    c.dst AS dst_id,
                    toString(c.created_at) AS created_at
-            ORDER BY id(c) ASC
+            ORDER BY toInteger(coalesce(c.change_seq, 0)) ASC
             LIMIT $limit
             """,
             {"cursor": cursor, "limit": int(limit)},

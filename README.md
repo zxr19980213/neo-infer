@@ -54,6 +54,27 @@ pip install pytest
 pytest -q
 ```
 
+## Neo4j Schema（索引/约束）与迁移
+- 应用启动时会自动执行 schema bootstrap（幂等）：
+  - `Rule.rule_id` 唯一约束
+  - `ConflictRule(head_relation, conflict_relation)` 复合唯一约束
+  - `RelationType.name` 唯一约束
+  - `RuleStat.rule_id` 唯一约束
+  - `IncrementalState.name` 唯一约束
+  - `IdSequence.name` 唯一约束
+  - `ChangeLog.change_seq` 唯一约束
+  - 常用查询索引（`Rule.head_relation`、`Rule.status`、`ChangeLog.rel`、`ChangeLog.event_type`、`ConflictCase.rule_id`）
+- 也可手动执行脚本：
+  - `scripts/neo4j_schema.cypher`
+  - `python scripts/apply_neo4j_schema.py`
+
+## ChangeLog 游标迁移（id() -> change_seq）
+- 已从 `id(c)` 游标迁移到应用层 `ChangeLog.change_seq`（单调递增）。
+- 增量消费与 pending 查询都基于 `change_seq`，避免 `id()` deprecation 风险。
+- 迁移兼容：
+  - schema 脚本会为历史 `ChangeLog` 回填 `change_seq`
+  - 同步初始化 `IdSequence{name:'ChangeLog'}.next_seq`
+
 ## API
 - `GET /health`
 - `POST /rules/mine`

@@ -31,6 +31,26 @@ from neo_infer.rule_mining import MiningConfig, RuleMiningService
 app = FastAPI(title="neo-infer", version="0.1.0")
 
 
+def ensure_neo4j_schema(db: Neo4jClient) -> None:
+    """Best-effort schema bootstrap for indexes/constraints."""
+    statements = [
+        "CREATE CONSTRAINT rule_rule_id_unique IF NOT EXISTS FOR (r:Rule) REQUIRE r.rule_id IS UNIQUE",
+        "CREATE CONSTRAINT conflict_rule_unique IF NOT EXISTS FOR (c:ConflictRule) REQUIRE (c.head_relation, c.conflict_relation) IS UNIQUE",
+        "CREATE CONSTRAINT relation_type_name_unique IF NOT EXISTS FOR (r:RelationType) REQUIRE r.name IS UNIQUE",
+        "CREATE CONSTRAINT rule_stat_rule_id_unique IF NOT EXISTS FOR (s:RuleStat) REQUIRE s.rule_id IS UNIQUE",
+        "CREATE CONSTRAINT incremental_state_name_unique IF NOT EXISTS FOR (s:IncrementalState) REQUIRE s.name IS UNIQUE",
+        "CREATE CONSTRAINT id_sequence_name_unique IF NOT EXISTS FOR (s:IdSequence) REQUIRE s.name IS UNIQUE",
+        "CREATE CONSTRAINT changelog_change_seq_unique IF NOT EXISTS FOR (c:ChangeLog) REQUIRE c.change_seq IS UNIQUE",
+        "CREATE INDEX changelog_event_type_idx IF NOT EXISTS FOR (c:ChangeLog) ON (c.event_type)",
+        "CREATE INDEX changelog_rel_idx IF NOT EXISTS FOR (c:ChangeLog) ON (c.rel)",
+        "CREATE INDEX rule_head_relation_idx IF NOT EXISTS FOR (r:Rule) ON (r.head_relation)",
+        "CREATE INDEX rule_status_idx IF NOT EXISTS FOR (r:Rule) ON (r.status)",
+        "CREATE INDEX conflictcase_rule_id_idx IF NOT EXISTS FOR (c:ConflictCase) ON (c.rule_id)",
+    ]
+    for statement in statements:
+        db.run_write(statement)
+
+
 def get_db(settings: Settings = Depends(get_settings)) -> Neo4jClient:
     return Neo4jClient(settings)
 
@@ -38,6 +58,16 @@ def get_db(settings: Settings = Depends(get_settings)) -> Neo4jClient:
 @app.get("/health")
 def health(settings: Settings = Depends(get_settings)) -> dict[str, str]:
     return {"status": "ok", "db": settings.neo4j_uri}
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    settings = get_settings()
+    db = Neo4jClient(settings)
+    try:
+        ensure_neo4j_schema(db)
+    finally:
+        db.close()
 
 
 @app.post("/rules/mine", response_model=MineRulesResponse)

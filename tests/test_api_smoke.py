@@ -21,6 +21,15 @@ def client_and_state(monkeypatch: pytest.MonkeyPatch):
     class FakeDB:
         driver = object()
 
+        def run_write(self, query: str, parameters: dict[str, Any] | None = None):
+            _ = query
+            _ = parameters
+            state.setdefault("schema_statements", []).append(query)
+            return []
+
+        def close(self):
+            return None
+
     class FakeQueryRepository:
         def __init__(self, driver: object, database: str = "neo4j") -> None:
             _ = driver
@@ -329,6 +338,7 @@ def client_and_state(monkeypatch: pytest.MonkeyPatch):
             "DeltaEdge",
             FakeDelta,
         )
+    monkeypatch.setattr(api_module, "Neo4jClient", lambda settings: FakeDB())
     api_module.app.dependency_overrides[api_module.get_db] = lambda: FakeDB()
 
     with TestClient(api_module.app) as client:
@@ -626,4 +636,14 @@ def test_from_changelog_non_empty_mixed_and_idempotent_contract(client_and_state
     assert p2["processed_changes"] == 0
     assert p2["affected_relations"] == []
     assert p2["rules"] == []
+
+
+def test_schema_bootstrap_is_called(client_and_state):
+    client, state = client_and_state
+    _ = client
+    executed = state.get("schema_statements", [])
+    # Startup should attempt to create all schema indexes/constraints.
+    assert len(executed) >= 1
+    assert any("CREATE CONSTRAINT rule_rule_id_unique" in stmt for stmt in executed)
+    assert any("CREATE CONSTRAINT changelog_change_seq_unique" in stmt for stmt in executed)
 

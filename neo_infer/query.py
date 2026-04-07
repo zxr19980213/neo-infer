@@ -65,6 +65,70 @@ class QueryRepository:
             records = session.run(query)
             return {str(record["relation"]): int(record["freq"]) for record in records}
 
+    @staticmethod
+    def _batch_length2_pca_denominators(session, phase1_records) -> dict[tuple[str, str, str], int]:
+        by_head: dict[str, set[tuple[str, str]]] = {}
+        for record in phase1_records:
+            r1 = str(record["r1"])
+            r2 = str(record["r2"])
+            r3 = str(record["r3"])
+            by_head.setdefault(r3, set()).add((r1, r2))
+
+        denominator_cache: dict[tuple[str, str, str], int] = {}
+        for head_rel, body_pairs in by_head.items():
+            escaped_head = head_rel.replace("`", "")
+            query = f"""
+            UNWIND $pairs AS pair
+            MATCH (x)-[a]->(z)-[b]->(y)
+            WHERE type(a) = pair.r1 AND type(b) = pair.r2
+              AND EXISTS {{ MATCH (x)-[:`{escaped_head}`]->() }}
+            RETURN pair.r1 AS r1, pair.r2 AS r2, count(DISTINCT [x, y]) AS pca_denominator
+            """
+            payload = [{"r1": r1, "r2": r2} for r1, r2 in sorted(body_pairs)]
+            rows = list(session.run(query, {"pairs": payload}))
+            found_keys: set[tuple[str, str]] = set()
+            for row in rows:
+                r1 = str(row["r1"])
+                r2 = str(row["r2"])
+                found_keys.add((r1, r2))
+                denominator_cache[(r1, r2, head_rel)] = int(row["pca_denominator"])
+            for r1, r2 in body_pairs:
+                denominator_cache.setdefault((r1, r2, head_rel), 0)
+        return denominator_cache
+
+    @staticmethod
+    def _batch_length3_pca_denominators(session, phase1_records) -> dict[tuple[str, str, str, str], int]:
+        by_head: dict[str, set[tuple[str, str, str]]] = {}
+        for record in phase1_records:
+            r1 = str(record["r1"])
+            r2 = str(record["r2"])
+            r3 = str(record["r3"])
+            head = str(record["head"])
+            by_head.setdefault(head, set()).add((r1, r2, r3))
+
+        denominator_cache: dict[tuple[str, str, str, str], int] = {}
+        for head_rel, body_triples in by_head.items():
+            escaped_head = head_rel.replace("`", "")
+            query = f"""
+            UNWIND $triples AS tri
+            MATCH (x)-[a]->(m1)-[b]->(m2)-[c]->(y)
+            WHERE type(a) = tri.r1 AND type(b) = tri.r2 AND type(c) = tri.r3
+              AND EXISTS {{ MATCH (x)-[:`{escaped_head}`]->() }}
+            RETURN tri.r1 AS r1, tri.r2 AS r2, tri.r3 AS r3, count(DISTINCT [x, y]) AS pca_denominator
+            """
+            payload = [{"r1": r1, "r2": r2, "r3": r3} for r1, r2, r3 in sorted(body_triples)]
+            rows = list(session.run(query, {"triples": payload}))
+            found_keys: set[tuple[str, str, str]] = set()
+            for row in rows:
+                r1 = str(row["r1"])
+                r2 = str(row["r2"])
+                r3 = str(row["r3"])
+                found_keys.add((r1, r2, r3))
+                denominator_cache[(r1, r2, r3, head_rel)] = int(row["pca_denominator"])
+            for r1, r2, r3 in body_triples:
+                denominator_cache.setdefault((r1, r2, r3, head_rel), 0)
+        return denominator_cache
+
     def length2_path_rule_candidates(self, limit: int = 5000) -> list[PathRuleCandidate]:
         # 规则模板：r1(X,Z) ∧ r2(Z,Y) -> r3(X,Y)
         # support: 同时满足 body 与 head 的 (X, Y) 去重数量
@@ -81,33 +145,19 @@ class QueryRepository:
 
         with self._driver.session(database=self._database) as session:
             phase1_records = list(session.run(phase1_query, {"limit": limit}))
+            denominator_cache = self._batch_length2_pca_denominators(session, phase1_records)
             candidates: list[PathRuleCandidate] = []
-            denominator_cache: dict[tuple[str, str, str], int] = {}
-
             for record in phase1_records:
                 r1 = str(record["r1"])
                 r2 = str(record["r2"])
                 r3 = str(record["r3"])
                 support = int(record["support"])
-                key = (r1, r2, r3)
-
-                if key not in denominator_cache:
-                    escaped_r3 = r3.replace("`", "")
-                    pca_query = f"""
-                    MATCH (x)-[a]->(z)-[b]->(y)
-                    WHERE type(a) = $r1 AND type(b) = $r2
-                      AND EXISTS {{ MATCH (x)-[:`{escaped_r3}`]->() }}
-                    RETURN count(DISTINCT [x, y]) AS pca_denominator
-                    """
-                    pca_record = session.run(pca_query, {"r1": r1, "r2": r2}).single()
-                    denominator_cache[key] = int(pca_record["pca_denominator"]) if pca_record else 0
-
                 candidates.append(
                     PathRuleCandidate(
                         body_relations=(r1, r2),
                         head_relation=r3,
                         support=support,
-                        pca_denominator=denominator_cache[key],
+                        pca_denominator=denominator_cache.get((r1, r2, r3), 0),
                     )
                 )
             return candidates
@@ -134,33 +184,19 @@ class QueryRepository:
 
         with self._driver.session(database=self._database) as session:
             phase1_records = list(session.run(phase1_query, {"limit": limit, "rels": touched}))
+            denominator_cache = self._batch_length2_pca_denominators(session, phase1_records)
             candidates: list[PathRuleCandidate] = []
-            denominator_cache: dict[tuple[str, str, str], int] = {}
-
             for record in phase1_records:
                 r1 = str(record["r1"])
                 r2 = str(record["r2"])
                 r3 = str(record["r3"])
                 support = int(record["support"])
-                key = (r1, r2, r3)
-
-                if key not in denominator_cache:
-                    escaped_r3 = r3.replace("`", "")
-                    pca_query = f"""
-                    MATCH (x)-[a]->(z)-[b]->(y)
-                    WHERE type(a) = $r1 AND type(b) = $r2
-                      AND EXISTS {{ MATCH (x)-[:`{escaped_r3}`]->() }}
-                    RETURN count(DISTINCT [x, y]) AS pca_denominator
-                    """
-                    pca_record = session.run(pca_query, {"r1": r1, "r2": r2}).single()
-                    denominator_cache[key] = int(pca_record["pca_denominator"]) if pca_record else 0
-
                 candidates.append(
                     PathRuleCandidate(
                         body_relations=(r1, r2),
                         head_relation=r3,
                         support=support,
-                        pca_denominator=denominator_cache[key],
+                        pca_denominator=denominator_cache.get((r1, r2, r3), 0),
                     )
                 )
             return candidates
@@ -178,33 +214,20 @@ class QueryRepository:
         """
         with self._driver.session(database=self._database) as session:
             phase1_records = list(session.run(phase1_query, {"limit": limit}))
+            denominator_cache = self._batch_length3_pca_denominators(session, phase1_records)
             candidates: list[PathRuleCandidate] = []
-            denominator_cache: dict[tuple[str, str, str, str], int] = {}
-
             for record in phase1_records:
                 r1 = str(record["r1"])
                 r2 = str(record["r2"])
                 r3 = str(record["r3"])
                 head = str(record["head"])
                 support = int(record["support"])
-                key = (r1, r2, r3, head)
-                if key not in denominator_cache:
-                    escaped_head = head.replace("`", "")
-                    pca_query = f"""
-                    MATCH (x)-[a]->(m1)-[b]->(m2)-[c]->(y)
-                    WHERE type(a) = $r1 AND type(b) = $r2 AND type(c) = $r3
-                      AND EXISTS {{ MATCH (x)-[:`{escaped_head}`]->() }}
-                    RETURN count(DISTINCT [x, y]) AS pca_denominator
-                    """
-                    pca_record = session.run(pca_query, {"r1": r1, "r2": r2, "r3": r3}).single()
-                    denominator_cache[key] = int(pca_record["pca_denominator"]) if pca_record else 0
-
                 candidates.append(
                     PathRuleCandidate(
                         body_relations=(r1, r2, r3),
                         head_relation=head,
                         support=support,
-                        pca_denominator=denominator_cache[key],
+                        pca_denominator=denominator_cache.get((r1, r2, r3, head), 0),
                     )
                 )
             return candidates
@@ -230,35 +253,20 @@ class QueryRepository:
         """
         with self._driver.session(database=self._database) as session:
             phase1_records = list(session.run(phase1_query, {"limit": limit, "rels": touched}))
+            denominator_cache = self._batch_length3_pca_denominators(session, phase1_records)
             candidates: list[PathRuleCandidate] = []
-            denominator_cache: dict[tuple[str, str, str, str], int] = {}
-
             for record in phase1_records:
                 r1 = str(record["r1"])
                 r2 = str(record["r2"])
                 r3 = str(record["r3"])
                 head = str(record["head"])
                 support = int(record["support"])
-                key = (r1, r2, r3, head)
-                if key not in denominator_cache:
-                    pca_query = """
-                    MATCH (x)-[a]->(m1)-[b]->(m2)-[c]->(y)
-                    WHERE type(a) = $r1 AND type(b) = $r2 AND type(c) = $r3
-                      AND EXISTS { MATCH (x)-[hh]->() WHERE type(hh) = $head_rel }
-                    RETURN count(DISTINCT [x, y]) AS pca_denominator
-                    """
-                    pca_record = session.run(
-                        pca_query,
-                        {"r1": r1, "r2": r2, "r3": r3, "head_rel": head},
-                    ).single()
-                    denominator_cache[key] = int(pca_record["pca_denominator"]) if pca_record else 0
-
                 candidates.append(
                     PathRuleCandidate(
                         body_relations=(r1, r2, r3),
                         head_relation=head,
                         support=support,
-                        pca_denominator=denominator_cache[key],
+                        pca_denominator=denominator_cache.get((r1, r2, r3, head), 0),
                     )
                 )
             return candidates
