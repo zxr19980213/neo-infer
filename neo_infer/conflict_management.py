@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from neo_infer.db import Neo4jClient
+from neo_infer.models import ConflictCase, Rule
 
 
 class ConflictStore:
@@ -72,49 +73,74 @@ class ConflictStore:
             {"pairs": payload},
         )
 
-    def record_conflict_cases(
-        self,
-        rule_id: str,
-        inferred_relation: str,
-        conflicting_relation: str,
-    ) -> int:
+    def record_conflict_cases(self, rule: Rule, negative_relation: str, iteration: int) -> int:
+        if len(rule.body_relations) != 2:
+            # 先支持长度2，长度3冲突记录后续扩展。
+            return 0
+
+        body_1 = rule.body_relations[0].replace("`", "")
+        body_2 = rule.body_relations[1].replace("`", "")
+        head_rel = rule.head_relation.replace("`", "")
+        neg_rel = negative_relation.replace("`", "")
+        query = f"""
+        MATCH (x)-[:`{body_1}`]->(z)-[:`{body_2}`]->(y)
+        WITH DISTINCT x, y
+        WHERE NOT EXISTS {{ MATCH (x)-[:`{head_rel}`]->(y) }}
+          AND EXISTS {{ MATCH (x)-[:`{neg_rel}`]->(y) }}
+        MERGE (cc:ConflictCase {{
+            rule_id: $rule_id,
+            inferred_relation: $inferred_relation,
+            conflicting_relation: $conflicting_relation,
+            source_x: elementId(x),
+            source_y: elementId(y)
+        }})
+        ON CREATE SET cc.created_at = datetime(),
+                      cc.detect_count = 1,
+                      cc.first_iteration = $iteration,
+                      cc.last_iteration = $iteration
+        SET cc.updated_at = datetime(),
+            cc.detect_count = coalesce(cc.detect_count, 0) + 1,
+            cc.last_iteration = $iteration
+        RETURN count(cc) AS cnt
+        """
         rows = self._client.run_write(
-            f"""
-            MATCH (x)-[:`{inferred_relation.replace("`", "")}`]->(z)-[:`{inferred_relation.replace("`", "")}`]->(y)
-            WITH DISTINCT x, y
-            WHERE EXISTS {{ MATCH (x)-[:`{conflicting_relation.replace("`", "")}`]->(y) }}
-            MERGE (cc:ConflictCase {{
-                rule_id: $rule_id,
-                inferred_relation: $inferred_relation,
-                conflicting_relation: $conflicting_relation,
-                source_id: elementId(x),
-                target_id: elementId(y)
-            }})
-            ON CREATE SET cc.created_at = datetime()
-            SET cc.updated_at = datetime()
-            RETURN count(cc) AS cnt
-            """,
+            query,
             {
-                "rule_id": rule_id,
-                "inferred_relation": inferred_relation,
-                "conflicting_relation": conflicting_relation,
+                "rule_id": rule.rule_id,
+                "inferred_relation": rule.head_relation,
+                "conflicting_relation": negative_relation,
+                "iteration": iteration,
             },
         )
         return int(rows[0]["cnt"]) if rows else 0
 
-    def list_conflict_cases(self, limit: int = 200) -> list[dict[str, str]]:
+    def list_conflict_cases(self, limit: int = 200) -> list[ConflictCase]:
         rows = self._client.run_read(
             """
             MATCH (cc:ConflictCase)
             RETURN cc.rule_id AS rule_id,
                    cc.inferred_relation AS inferred_relation,
                    cc.conflicting_relation AS conflicting_relation,
-                   cc.source_id AS source_id,
-                   cc.target_id AS target_id,
-                   toString(cc.updated_at) AS updated_at
-            ORDER BY cc.updated_at DESC
+                   cc.source_x AS source_x,
+                   cc.source_y AS source_y,
+                   coalesce(cc.detect_count, 0) AS detect_count,
+                   coalesce(cc.first_iteration, 1) AS first_iteration,
+                   coalesce(cc.last_iteration, 1) AS last_iteration
+            ORDER BY cc.updated_at DESC, cc.detect_count DESC
             LIMIT $limit
             """,
             {"limit": limit},
         )
-        return rows
+        return [
+            ConflictCase(
+                rule_id=str(row["rule_id"]),
+                inferred_relation=str(row["inferred_relation"]),
+                conflicting_relation=str(row["conflicting_relation"]),
+                source_x=str(row["source_x"]),
+                source_y=str(row["source_y"]),
+                detect_count=int(row["detect_count"]),
+                first_iteration=int(row["first_iteration"]),
+                last_iteration=int(row["last_iteration"]),
+            )
+            for row in rows
+        ]

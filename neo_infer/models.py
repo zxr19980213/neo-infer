@@ -19,6 +19,10 @@ def _normalize_token(token: str) -> str:
     return re.sub(r"[^a-z0-9_]+", "_", value).strip("_")
 
 
+def normalize_relation_token(token: str) -> str:
+    return token.strip().replace("`", "")
+
+
 class Rule(BaseModel):
     rule_id: str
     body_relations: tuple[str, ...]
@@ -50,7 +54,8 @@ class MineRulesRequest(BaseModel):
     min_pca_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     min_head_coverage: float | None = Field(default=None, ge=0.0, le=1.0)
     candidate_limit: int | None = Field(default=None, ge=1, le=50000)
-    max_body_length: int = Field(default=2, ge=2, le=3)
+    body_length: int = Field(default=2, ge=2, le=3)
+    changed_relations: list[str] | None = None
 
 
 class MineRulesResponse(BaseModel):
@@ -101,13 +106,13 @@ class ConflictCase(BaseModel):
     rule_id: str
     inferred_relation: str
     conflicting_relation: str
-    source_x: str
-    source_y: str
+    source_id: str
+    target_id: str
     detect_count: int = Field(ge=0)
     first_iteration: int = Field(ge=1)
     last_iteration: int = Field(ge=1)
 
 
-class ConflictCasesResponse(BaseModel):
+class ConflictCaseListResponse(BaseModel):
     cases: list[ConflictCase]
 

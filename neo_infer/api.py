@@ -7,7 +7,8 @@ from neo_infer.conflict_management import ConflictStore
 from neo_infer.db import Neo4jClient
 from neo_infer.inference import InferenceEngine
 from neo_infer.models import (
-    ConflictCaseListResponse,
+    ConflictCasesResponse,
+    IncrementalMineRequest,
     ConflictPairsResponse,
     ConflictPairsUpdateRequest,
     InferenceRequest,
@@ -40,23 +41,95 @@ def mine_rules(
 ) -> MineRulesResponse:
     repo = QueryRepository(db.driver, database=settings.neo4j_database)
     miner = RuleMiningService(repo)
-    discovered = miner.mine_rules(
-        MiningConfig(
-            min_support=payload.min_support if payload.min_support is not None else settings.min_support,
-            min_pca_confidence=(
-                payload.min_pca_confidence
-                if payload.min_pca_confidence is not None
-                else settings.min_confidence
-            ),
-            min_head_coverage=payload.min_head_coverage or 0.0,
-            top_k=payload.limit,
-            candidate_limit=payload.candidate_limit or max(payload.limit * 20, 100),
-            body_length=payload.body_length,
-            changed_relations=payload.changed_relations,
-        )
+    config = MiningConfig(
+        min_support=payload.min_support if payload.min_support is not None else settings.min_support,
+        min_pca_confidence=(
+            payload.min_pca_confidence
+            if payload.min_pca_confidence is not None
+            else settings.min_confidence
+        ),
+        min_head_coverage=payload.min_head_coverage or 0.0,
+        top_k=payload.limit,
+        candidate_limit=payload.candidate_limit or max(payload.limit * 20, 100),
     )
+    if payload.max_body_length == 3:
+        discovered = miner.mine_length3_rules(config)
+    else:
+        discovered = miner.mine_length2_rules(config)
     store = RuleStore(db)
     store.upsert_rules(discovered)
+    return MineRulesResponse(rules=discovered)
+
+
+@app.post("/rules/mine/length3", response_model=MineRulesResponse)
+def mine_rules_length3(
+    payload: MineRulesRequest,
+    settings: Settings = Depends(get_settings),
+    db: Neo4jClient = Depends(get_db),
+) -> MineRulesResponse:
+    repo = QueryRepository(db.driver, database=settings.neo4j_database)
+    miner = RuleMiningService(repo)
+    config = MiningConfig(
+        min_support=payload.min_support if payload.min_support is not None else settings.min_support,
+        min_pca_confidence=(
+            payload.min_pca_confidence
+            if payload.min_pca_confidence is not None
+            else settings.min_confidence
+        ),
+        min_head_coverage=payload.min_head_coverage or 0.0,
+        top_k=payload.limit,
+        candidate_limit=payload.candidate_limit or max(payload.limit * 20, 100),
+    )
+    discovered = miner.mine_length3_rules(config)
+    RuleStore(db).upsert_rules(discovered)
+    return MineRulesResponse(rules=discovered)
+
+
+@app.post("/rules/mine/incremental/length2", response_model=MineRulesResponse)
+def mine_rules_incremental_length2(
+    payload: IncrementalMineRequest,
+    settings: Settings = Depends(get_settings),
+    db: Neo4jClient = Depends(get_db),
+) -> MineRulesResponse:
+    repo = QueryRepository(db.driver, database=settings.neo4j_database)
+    miner = RuleMiningService(repo)
+    config = MiningConfig(
+        min_support=payload.min_support if payload.min_support is not None else settings.min_support,
+        min_pca_confidence=(
+            payload.min_pca_confidence
+            if payload.min_pca_confidence is not None
+            else settings.min_confidence
+        ),
+        min_head_coverage=payload.min_head_coverage or 0.0,
+        top_k=payload.limit,
+        candidate_limit=payload.candidate_limit or max(payload.limit * 20, 100),
+    )
+    discovered = miner.mine_length2_rules_incremental(config, payload.affected_relations)
+    RuleStore(db).upsert_rules(discovered)
+    return MineRulesResponse(rules=discovered)
+
+
+@app.post("/rules/mine/incremental/length3", response_model=MineRulesResponse)
+def mine_rules_incremental_length3(
+    payload: IncrementalMineRequest,
+    settings: Settings = Depends(get_settings),
+    db: Neo4jClient = Depends(get_db),
+) -> MineRulesResponse:
+    repo = QueryRepository(db.driver, database=settings.neo4j_database)
+    miner = RuleMiningService(repo)
+    config = MiningConfig(
+        min_support=payload.min_support if payload.min_support is not None else settings.min_support,
+        min_pca_confidence=(
+            payload.min_pca_confidence
+            if payload.min_pca_confidence is not None
+            else settings.min_confidence
+        ),
+        min_head_coverage=payload.min_head_coverage or 0.0,
+        top_k=payload.limit,
+        candidate_limit=payload.candidate_limit or max(payload.limit * 20, 100),
+    )
+    discovered = miner.mine_length3_rules_incremental(config, payload.affected_relations)
+    RuleStore(db).upsert_rules(discovered)
     return MineRulesResponse(rules=discovered)
 
 
@@ -133,10 +206,10 @@ def delete_conflict_pair(
     }
 
 
-@app.get("/conflicts/cases", response_model=ConflictCaseListResponse)
-def list_conflict_cases(limit: int = 100, db: Neo4jClient = Depends(get_db)) -> ConflictCaseListResponse:
+@app.get("/conflicts/cases", response_model=ConflictCasesResponse)
+def list_conflict_cases(limit: int = 100, db: Neo4jClient = Depends(get_db)) -> ConflictCasesResponse:
     store = ConflictStore(db)
-    return ConflictCaseListResponse(cases=store.list_cases(limit=limit))
+    return ConflictCasesResponse(cases=store.list_conflict_cases(limit=limit))
 
 
 @app.post("/inference/run", response_model=InferenceResponse)

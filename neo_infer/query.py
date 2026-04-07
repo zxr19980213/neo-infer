@@ -9,9 +9,8 @@ from neo_infer.models import ConflictCase, Rule
 
 @dataclass(frozen=True)
 class PathRuleCandidate:
-    body_r1: str
-    body_r2: str
-    head_r3: str
+    body_relations: tuple[str, ...]
+    head_relation: str
     support: int
     pca_denominator: int
 
@@ -20,6 +19,26 @@ class PathRuleCandidate:
         if self.pca_denominator <= 0:
             return 0.0
         return self.support / self.pca_denominator
+
+    @property
+    def body_r1(self) -> str:
+        return self.body_relations[0]
+
+    @property
+    def body_r2(self) -> str:
+        return self.body_relations[1]
+
+    @property
+    def head_r3(self) -> str:
+        return self.head_relation
+
+    @property
+    def body_r3(self) -> str:
+        return self.body_relations[2]
+
+    @property
+    def head_r4(self) -> str:
+        return self.head_relation
 
 
 class QueryRepository:
@@ -85,9 +104,8 @@ class QueryRepository:
 
                 candidates.append(
                     PathRuleCandidate(
-                        body_r1=r1,
-                        body_r2=r2,
-                        head_r3=r3,
+                        body_relations=(r1, r2),
+                        head_relation=r3,
                         support=support,
                         pca_denominator=denominator_cache[key],
                     )

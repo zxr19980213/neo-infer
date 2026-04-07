@@ -27,6 +27,10 @@ class InferenceEngine:
         self.conflict_store = conflict_store
         self.conflict_rule_map: dict[str, set[str]] = conflict_pairs or {}
 
+    @staticmethod
+    def _body_length(rule) -> int:
+        return len(rule.body_relations)
+
     def _count_conflicts_for_rule(self, rule, check_conflicts: bool) -> int:
         if not check_conflicts:
             return 0
@@ -45,10 +49,19 @@ class InferenceEngine:
         total = 0
         for negative_relation in conflict_relations:
             total += self.conflict_store.record_conflict_cases(
+                query_repo=self.query_repo,
                 rule=rule,
                 negative_relation=negative_relation,
             )
         return total
+
+    def _apply_rule(self, rule) -> int:
+        body_len = self._body_length(rule)
+        if body_len == 2:
+            return self.query_repo.apply_length2_rule(rule)
+        if body_len == 3:
+            return self.query_repo.apply_length3_rule(rule)
+        raise ValueError(f"Unsupported rule body length: {body_len}")
 
     def run_once(
         self,
@@ -61,7 +74,7 @@ class InferenceEngine:
         for rule in adopted_rules:
             conflicts = self._count_conflicts_for_rule(rule, check_conflicts=check_conflicts)
             self._persist_conflicts_for_rule(rule)
-            created = self.query_repo.apply_length2_rule(rule)
+            created = self._apply_rule(rule)
             total_conflicts += conflicts
             if created > 0:
                 self.rule_store.update_rule_status(rule.rule_id, "applied")
@@ -94,7 +107,7 @@ class InferenceEngine:
             for rule in adopted_rules:
                 conflicts = self._count_conflicts_for_rule(rule, check_conflicts=check_conflicts)
                 self._persist_conflicts_for_rule(rule)
-                created = self.query_repo.apply_length2_rule(rule)
+                created = self._apply_rule(rule)
                 created_in_iteration += created
                 total_conflicts += conflicts
                 if created > 0:

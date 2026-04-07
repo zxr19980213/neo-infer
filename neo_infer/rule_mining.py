@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from neo_infer.models import Rule, build_rule_id, normalize_relation_token
 from neo_infer.query import QueryRepository
@@ -13,6 +13,8 @@ class MiningConfig:
     min_head_coverage: float = 0.0
     top_k: int = 100
     candidate_limit: int = 2000
+    body_length: int = 2
+    changed_relations: list[str] | None = None
 
 
 class RuleMiningService:
@@ -20,6 +22,16 @@ class RuleMiningService:
 
     def __init__(self, repository: QueryRepository) -> None:
         self._repository = repository
+
+    def mine_rules(self, config: MiningConfig) -> list[Rule]:
+        if config.body_length == 3:
+            if config.changed_relations:
+                return self.mine_length3_rules_incremental(config, config.changed_relations)
+            return self.mine_length3_rules(config)
+
+        if config.changed_relations:
+            return self.mine_length2_rules_incremental(config, config.changed_relations)
+        return self.mine_length2_rules(config)
 
     def mine_length2_rules(self, config: MiningConfig) -> list[Rule]:
         raw_candidates = self._repository.length2_path_rule_candidates(limit=config.candidate_limit)
@@ -90,6 +102,24 @@ class RuleMiningService:
             )
         rules.sort(key=lambda x: (x.pca_confidence, x.support, x.head_coverage), reverse=True)
         return rules[: config.top_k]
+
+    def mine_length3_rules_incremental(
+        self,
+        config: MiningConfig,
+        affected_relations: list[str],
+    ) -> list[Rule]:
+        normalized = [normalize_relation_token(item) for item in affected_relations]
+        normalized = [item for item in normalized if item]
+        if not normalized:
+            return []
+
+        base_rules = self.mine_length3_rules(replace(config, changed_relations=None))
+        filtered: list[Rule] = []
+        touched = set(normalized)
+        for rule in base_rules:
+            if rule.head_relation in touched or any(rel in touched for rel in rule.body_relations):
+                filtered.append(rule)
+        return filtered[: config.top_k]
 
     def mine_length3_rules(self, config: MiningConfig) -> list[Rule]:
         raw_candidates = self._repository.length3_path_rule_candidates(limit=config.candidate_limit)
