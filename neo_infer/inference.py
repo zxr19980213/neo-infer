@@ -10,33 +10,34 @@ class InferenceEngine:
         self.query_repo = query_repo
         self.rule_store = rule_store
 
-    def apply_adopted_rules_once(self, limit_rules: int = 100) -> list[ApplyRuleResult]:
+    def run_once(self, limit_rules: int = 100) -> list[ApplyRuleResult]:
         results: list[ApplyRuleResult] = []
         adopted_rules = self.rule_store.list_rules(status="adopted", limit=limit_rules)
         for rule in adopted_rules:
-            created = self.query_repo.apply_path_rule_once(rule)
+            created = self.query_repo.apply_length2_rule(rule)
             if created > 0:
                 self.rule_store.update_rule_status(rule.rule_id, "applied")
             results.append(ApplyRuleResult(rule_id=rule.rule_id, created_triples=created, iteration=1))
         return results
 
-    def apply_adopted_rules_fixpoint(
+    def run_fixpoint(
         self,
         limit_rules: int = 100,
         max_iterations: int = 5,
     ) -> list[ApplyRuleResult]:
         all_results: list[ApplyRuleResult] = []
-        for iteration in range(1, max_iterations + 1):
-            rules = self.rule_store.list_rules(status="adopted", limit=limit_rules)
-            if not rules:
-                break
+        adopted_rules = self.rule_store.list_rules(status="adopted", limit=limit_rules)
+        if not adopted_rules:
+            return all_results
 
+        rules_with_new_facts: set[str] = set()
+        for iteration in range(1, max_iterations + 1):
             created_in_iteration = 0
-            for rule in rules:
-                created = self.query_repo.apply_path_rule_once(rule)
+            for rule in adopted_rules:
+                created = self.query_repo.apply_length2_rule(rule)
                 created_in_iteration += created
                 if created > 0:
-                    self.rule_store.update_rule_status(rule.rule_id, "applied")
+                    rules_with_new_facts.add(rule.rule_id)
                 all_results.append(
                     ApplyRuleResult(
                         rule_id=rule.rule_id,
@@ -47,4 +48,18 @@ class InferenceEngine:
 
             if created_in_iteration == 0:
                 break
+
+        for rule_id in rules_with_new_facts:
+            self.rule_store.update_rule_status(rule_id, "applied")
         return all_results
+
+    # Backward-compatible aliases.
+    def apply_adopted_rules_once(self, limit_rules: int = 100) -> list[ApplyRuleResult]:
+        return self.run_once(limit_rules=limit_rules)
+
+    def apply_adopted_rules_fixpoint(
+        self,
+        limit_rules: int = 100,
+        max_iterations: int = 5,
+    ) -> list[ApplyRuleResult]:
+        return self.run_fixpoint(limit_rules=limit_rules, max_iterations=max_iterations)
