@@ -32,8 +32,9 @@ class IncrementalMiningService:
         self,
         request: MineRulesRequest,
         body_length: int,
+        change_limit: int = 2000,
     ) -> IncrementalRunResult:
-        delta = self.incremental_store.consume_delta(limit=2000)
+        delta = self.incremental_store.consume_delta(limit=change_limit)
         events = [*delta.added_edges, *delta.removed_edges]
         affected_relations = sorted(
             {

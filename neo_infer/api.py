@@ -75,7 +75,16 @@ def append_changes(
 ) -> ChangeLogPendingResponse:
     _ = settings
     store = IncrementalStore(db)
-    store.append_changes(payload.added_edges, payload.removed_edges)
+    store.append_changes(
+        added_edges=[
+            item.to_change_edge("added")
+            for item in payload.added_edges
+        ],
+        removed_edges=[
+            item.to_change_edge("removed")
+            for item in payload.removed_edges
+        ],
+    )
     pending = store.pending_changes(limit=1000)
     return ChangeLogPendingResponse(
         pending_count=len(pending),

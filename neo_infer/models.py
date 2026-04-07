@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Literal, Sequence
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 RuleStatus = Literal["discovered", "adopted", "applied", "rejected"]
 
@@ -146,6 +146,21 @@ class EdgeItem(BaseModel):
     src_id: str
     relation: str
     dst_id: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def from_aliases(cls, data):
+        if not isinstance(data, dict):
+            return data
+        mapped = dict(data)
+        # Backward-compatible aliases for external callers.
+        if "src_id" not in mapped and "src" in mapped:
+            mapped["src_id"] = mapped["src"]
+        if "dst_id" not in mapped and "dst" in mapped:
+            mapped["dst_id"] = mapped["dst"]
+        if "relation" not in mapped and "rel" in mapped:
+            mapped["relation"] = mapped["rel"]
+        return mapped
 
 
 class ChangeLogAppendRequest(BaseModel):
