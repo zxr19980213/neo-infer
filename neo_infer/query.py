@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from neo4j import Driver
 
-from neo_infer.models import Rule
+from neo_infer.models import ConflictCase, Rule
 
 
 @dataclass(frozen=True)
@@ -94,6 +94,50 @@ class QueryRepository:
                 )
             return candidates
 
+    def length3_path_rule_candidates(self, limit: int = 5000) -> list[PathRuleCandidate]:
+        # 规则模板：r1(X,A) ∧ r2(A,B) ∧ r3(B,Y) -> h(X,Y)
+        phase1_query = """
+        MATCH (x)-[a]->(m1)-[b]->(m2)-[c]->(y)
+        WITH type(a) AS r1, type(b) AS r2, type(c) AS r3, x, y
+        MATCH (x)-[h]->(y)
+        WITH r1, r2, r3, type(h) AS head, collect(DISTINCT [x, y]) AS pairs
+        RETURN r1, r2, r3, head, size(pairs) AS support
+        ORDER BY support DESC
+        LIMIT $limit
+        """
+        with self._driver.session(database=self._database) as session:
+            phase1_records = list(session.run(phase1_query, {"limit": limit}))
+            candidates: list[PathRuleCandidate] = []
+            denominator_cache: dict[tuple[str, str, str, str], int] = {}
+
+            for record in phase1_records:
+                r1 = str(record["r1"])
+                r2 = str(record["r2"])
+                r3 = str(record["r3"])
+                head = str(record["head"])
+                support = int(record["support"])
+                key = (r1, r2, r3, head)
+                if key not in denominator_cache:
+                    escaped_head = head.replace("`", "")
+                    pca_query = f"""
+                    MATCH (x)-[a]->(m1)-[b]->(m2)-[c]->(y)
+                    WHERE type(a) = $r1 AND type(b) = $r2 AND type(c) = $r3
+                      AND EXISTS {{ MATCH (x)-[:`{escaped_head}`]->() }}
+                    RETURN count(DISTINCT [x, y]) AS pca_denominator
+                    """
+                    pca_record = session.run(pca_query, {"r1": r1, "r2": r2, "r3": r3}).single()
+                    denominator_cache[key] = int(pca_record["pca_denominator"]) if pca_record else 0
+
+                candidates.append(
+                    PathRuleCandidate(
+                        body_relations=(r1, r2, r3),
+                        head_relation=head,
+                        support=support,
+                        pca_denominator=denominator_cache[key],
+                    )
+                )
+            return candidates
+
     def apply_length2_rule(self, rule: Rule) -> int:
         body_r1 = rule.body_relations[0].replace("`", "")
         body_r2 = rule.body_relations[1].replace("`", "")
@@ -138,3 +182,32 @@ class QueryRepository:
         with self._driver.session(database=self._database) as session:
             record = session.run(query).single()
             return int(record["conflict_count"]) if record else 0
+
+    def list_conflict_cases_for_rule(self, rule: Rule, negative_relation: str, limit: int = 1000) -> list[ConflictCase]:
+        body_rel_1 = rule.body_relations[0].replace("`", "")
+        body_rel_2 = rule.body_relations[1].replace("`", "")
+        head_rel = rule.head_relation.replace("`", "")
+        neg_rel = negative_relation.replace("`", "")
+
+        query = f"""
+        MATCH (x)-[:`{body_rel_1}`]->(z)-[:`{body_rel_2}`]->(y)
+        WITH DISTINCT x, y
+        WHERE NOT EXISTS {{ MATCH (x)-[:`{head_rel}`]->(y) }}
+          AND EXISTS {{ MATCH (x)-[:`{neg_rel}`]->(y) }}
+        RETURN elementId(x) AS x_id, elementId(y) AS y_id
+        LIMIT $limit
+        """
+        with self._driver.session(database=self._database) as session:
+            rows = list(session.run(query, {"limit": limit}))
+            result: list[ConflictCase] = []
+            for row in rows:
+                result.append(
+                    ConflictCase(
+                        rule_id=rule.rule_id,
+                        x_id=str(row["x_id"]),
+                        y_id=str(row["y_id"]),
+                        inferred_relation=rule.head_relation,
+                        conflicting_relation=negative_relation,
+                    )
+                )
+            return result

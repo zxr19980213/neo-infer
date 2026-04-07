@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from neo_infer.conflict_management import ConflictStore
 from neo_infer.models import ApplyRuleResult
 from neo_infer.query import QueryRepository
 from neo_infer.rule_management import RuleStore
@@ -18,10 +19,12 @@ class InferenceEngine:
         self,
         query_repo: QueryRepository,
         rule_store: RuleStore,
+        conflict_store: ConflictStore | None = None,
         conflict_pairs: dict[str, set[str]] | None = None,
     ) -> None:
         self.query_repo = query_repo
         self.rule_store = rule_store
+        self.conflict_store = conflict_store
         self.conflict_rule_map: dict[str, set[str]] = conflict_pairs or {}
 
     def _count_conflicts_for_rule(self, rule, check_conflicts: bool) -> int:
@@ -31,6 +34,20 @@ class InferenceEngine:
         total = 0
         for negative_relation in conflict_relations:
             total += self.query_repo.count_conflicts_for_rule(rule, negative_relation)
+        return total
+
+    def _persist_conflicts_for_rule(self, rule) -> int:
+        if self.conflict_store is None:
+            return 0
+        conflict_relations = self.conflict_rule_map.get(rule.head_relation, set())
+        if not conflict_relations:
+            return 0
+        total = 0
+        for negative_relation in conflict_relations:
+            total += self.conflict_store.record_conflict_cases(
+                rule=rule,
+                negative_relation=negative_relation,
+            )
         return total
 
     def run_once(
@@ -43,6 +60,7 @@ class InferenceEngine:
         adopted_rules = self.rule_store.list_rules(status="adopted", limit=limit_rules)
         for rule in adopted_rules:
             conflicts = self._count_conflicts_for_rule(rule, check_conflicts=check_conflicts)
+            self._persist_conflicts_for_rule(rule)
             created = self.query_repo.apply_length2_rule(rule)
             total_conflicts += conflicts
             if created > 0:
@@ -75,6 +93,7 @@ class InferenceEngine:
             created_in_iteration = 0
             for rule in adopted_rules:
                 conflicts = self._count_conflicts_for_rule(rule, check_conflicts=check_conflicts)
+                self._persist_conflicts_for_rule(rule)
                 created = self.query_repo.apply_length2_rule(rule)
                 created_in_iteration += created
                 total_conflicts += conflicts

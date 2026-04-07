@@ -3,11 +3,13 @@
 知识图谱规则挖掘与推理服务（MVP）。
 
 ## 当前实现范围
-- 规则挖掘：长度为 2 的路径规则  
-  `r1(X,Z) ∧ r2(Z,Y) -> r3(X,Y)`
+- 规则挖掘：长度为 2/3 的路径规则  
+  - `r1(X,Z) ∧ r2(Z,Y) -> r3(X,Y)`
+  - `r1(X,A) ∧ r2(A,B) ∧ r3(B,Y) -> r4(X,Y)`
 - 指标：`support`、`pca_confidence`、`head_coverage`
 - 规则管理：`discovered / adopted / applied / rejected`
 - 规则应用：已采纳规则单轮推理，写入 `is_inferred=true` 的关系
+- 冲突管理：数据库持久化冲突规则 + 冲突实例落库（`ConflictCase`）
 
 ## 项目结构
 ```text
@@ -48,6 +50,7 @@ uvicorn main:app --reload
 - `POST /rules/{rule_id}/reject`
 - `GET /conflicts`
 - `PUT /conflicts`
+- `GET /conflicts/cases?limit=100`
 - `POST /inference/run`
 
 ## 推理接口说明（增强）
@@ -73,3 +76,24 @@ uvicorn main:app --reload
 - 响应中会返回：
   - `results[].conflict_triples`
   - `total_conflicts`
+- 冲突实例会记录到 `ConflictCase`：
+  - `rule_id`
+  - `inferred_relation`
+  - `conflicting_relation`
+  - `x_name / y_name`
+  - `detected_at`
+
+## 规则挖掘请求示例（长度2/3 + 增量）
+```json
+{
+  "limit": 200,
+  "rule_length": 3,
+  "min_support": 1,
+  "min_pca_confidence": 0.2,
+  "candidate_limit": 5000,
+  "affected_relations": ["bornIn", "locatedIn"]
+}
+```
+
+- `rule_length`: `2` 或 `3`
+- `affected_relations`: 可选，增量重算入口；仅挖掘 body/head 涉及这些关系的候选规则

@@ -7,6 +7,7 @@ from neo_infer.conflict_management import ConflictStore
 from neo_infer.db import Neo4jClient
 from neo_infer.inference import InferenceEngine
 from neo_infer.models import (
+    ConflictCaseListResponse,
     ConflictPairsResponse,
     ConflictPairsUpdateRequest,
     InferenceRequest,
@@ -39,7 +40,7 @@ def mine_rules(
 ) -> MineRulesResponse:
     repo = QueryRepository(db.driver, database=settings.neo4j_database)
     miner = RuleMiningService(repo)
-    discovered = miner.mine_length2_rules(
+    discovered = miner.mine_rules(
         MiningConfig(
             min_support=payload.min_support if payload.min_support is not None else settings.min_support,
             min_pca_confidence=(
@@ -50,6 +51,8 @@ def mine_rules(
             min_head_coverage=payload.min_head_coverage or 0.0,
             top_k=payload.limit,
             candidate_limit=payload.candidate_limit or max(payload.limit * 20, 100),
+            body_length=payload.body_length,
+            changed_relations=payload.changed_relations,
         )
     )
     store = RuleStore(db)
@@ -128,6 +131,12 @@ def delete_conflict_pair(
         "inferred_relation": inferred_relation,
         "conflicting_relation": conflicting_relation,
     }
+
+
+@app.get("/conflicts/cases", response_model=ConflictCaseListResponse)
+def list_conflict_cases(limit: int = 100, db: Neo4jClient = Depends(get_db)) -> ConflictCaseListResponse:
+    store = ConflictStore(db)
+    return ConflictCaseListResponse(cases=store.list_cases(limit=limit))
 
 
 @app.post("/inference/run", response_model=InferenceResponse)
