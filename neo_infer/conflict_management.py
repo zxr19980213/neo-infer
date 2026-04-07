@@ -74,37 +74,68 @@ class ConflictStore:
         )
 
     def record_conflict_cases(self, rule: Rule, negative_relation: str, iteration: int) -> int:
-        if len(rule.body_relations) < 2:
+        body_len = len(rule.body_relations)
+        if body_len < 2:
             return 0
-
-        body_1 = rule.body_relations[0].replace("`", "")
-        body_2 = rule.body_relations[1].replace("`", "")
         head_rel = rule.head_relation.replace("`", "")
         neg_rel = negative_relation.replace("`", "")
-        query = f"""
-        MATCH (x)-[:`{body_1}`]->(z)-[:`{body_2}`]->(y)
-        WITH DISTINCT x, y
-        WHERE NOT EXISTS {{ MATCH (x)-[:`{head_rel}`]->(y) }}
-          AND EXISTS {{ MATCH (x)-[:`{neg_rel}`]->(y) }}
-        MERGE (cc:ConflictCase {{
-            rule_id: $rule_id,
-            inferred_relation: $inferred_relation,
-            conflicting_relation: $conflicting_relation,
-            source_x: elementId(x),
-            source_y: elementId(y)
-        }})
-        ON CREATE SET cc.created_at = datetime(),
-                      cc.detect_count = 1,
-                      cc.first_iteration = $iteration,
-                      cc.last_iteration = $iteration
-        SET cc.updated_at = datetime(),
-            cc.detect_count = CASE
-              WHEN cc.last_iteration = $iteration THEN coalesce(cc.detect_count, 0)
-              ELSE coalesce(cc.detect_count, 0) + 1
-            END,
-            cc.last_iteration = $iteration
-        RETURN count(cc) AS cnt
-        """
+        if body_len == 2:
+            body_1 = rule.body_relations[0].replace("`", "")
+            body_2 = rule.body_relations[1].replace("`", "")
+            query = f"""
+            MATCH (x)-[:`{body_1}`]->(z)-[:`{body_2}`]->(y)
+            WITH DISTINCT x, y
+            WHERE NOT EXISTS {{ MATCH (x)-[:`{head_rel}`]->(y) }}
+              AND EXISTS {{ MATCH (x)-[:`{neg_rel}`]->(y) }}
+            MERGE (cc:ConflictCase {{
+                rule_id: $rule_id,
+                inferred_relation: $inferred_relation,
+                conflicting_relation: $conflicting_relation,
+                source_x: elementId(x),
+                source_y: elementId(y)
+            }})
+            ON CREATE SET cc.created_at = datetime(),
+                          cc.detect_count = 1,
+                          cc.first_iteration = $iteration,
+                          cc.last_iteration = $iteration
+            SET cc.updated_at = datetime(),
+                cc.detect_count = CASE
+                  WHEN cc.last_iteration = $iteration THEN coalesce(cc.detect_count, 0)
+                  ELSE coalesce(cc.detect_count, 0) + 1
+                END,
+                cc.last_iteration = $iteration
+            RETURN count(cc) AS cnt
+            """
+        elif body_len == 3:
+            body_1 = rule.body_relations[0].replace("`", "")
+            body_2 = rule.body_relations[1].replace("`", "")
+            body_3 = rule.body_relations[2].replace("`", "")
+            query = f"""
+            MATCH (x)-[:`{body_1}`]->(m1)-[:`{body_2}`]->(m2)-[:`{body_3}`]->(y)
+            WITH DISTINCT x, y
+            WHERE NOT EXISTS {{ MATCH (x)-[:`{head_rel}`]->(y) }}
+              AND EXISTS {{ MATCH (x)-[:`{neg_rel}`]->(y) }}
+            MERGE (cc:ConflictCase {{
+                rule_id: $rule_id,
+                inferred_relation: $inferred_relation,
+                conflicting_relation: $conflicting_relation,
+                source_x: elementId(x),
+                source_y: elementId(y)
+            }})
+            ON CREATE SET cc.created_at = datetime(),
+                          cc.detect_count = 1,
+                          cc.first_iteration = $iteration,
+                          cc.last_iteration = $iteration
+            SET cc.updated_at = datetime(),
+                cc.detect_count = CASE
+                  WHEN cc.last_iteration = $iteration THEN coalesce(cc.detect_count, 0)
+                  ELSE coalesce(cc.detect_count, 0) + 1
+                END,
+                cc.last_iteration = $iteration
+            RETURN count(cc) AS cnt
+            """
+        else:
+            return 0
         rows = self._client.run_write(
             query,
             {

@@ -383,38 +383,65 @@ class QueryRepository:
         negative_relation: str,
     ) -> int:
         """Count candidate inferred pairs that already have a negative relation."""
-        body_r1 = rule.body_relations[0].replace("`", "")
-        body_r2 = rule.body_relations[1].replace("`", "")
-        head_r3 = rule.head_relation.replace("`", "")
+        body_len = len(rule.body_relations)
+        head_rel = rule.head_relation.replace("`", "")
         neg_rel = negative_relation.replace("`", "")
-
-        query = f"""
-        MATCH (x)-[:`{body_r1}`]->(z)-[:`{body_r2}`]->(y)
-        WITH DISTINCT x, y
-        WHERE NOT EXISTS {{ MATCH (x)-[:`{head_r3}`]->(y) }}
-          AND EXISTS {{ MATCH (x)-[:`{neg_rel}`]->(y) }}
-        RETURN count(*) AS conflict_count
-        """
+        if body_len == 2:
+            body_r1 = rule.body_relations[0].replace("`", "")
+            body_r2 = rule.body_relations[1].replace("`", "")
+            query = f"""
+            MATCH (x)-[:`{body_r1}`]->(z)-[:`{body_r2}`]->(y)
+            WITH DISTINCT x, y
+            WHERE NOT EXISTS {{ MATCH (x)-[:`{head_rel}`]->(y) }}
+              AND EXISTS {{ MATCH (x)-[:`{neg_rel}`]->(y) }}
+            RETURN count(*) AS conflict_count
+            """
+        elif body_len == 3:
+            body_r1 = rule.body_relations[0].replace("`", "")
+            body_r2 = rule.body_relations[1].replace("`", "")
+            body_r3 = rule.body_relations[2].replace("`", "")
+            query = f"""
+            MATCH (x)-[:`{body_r1}`]->(m1)-[:`{body_r2}`]->(m2)-[:`{body_r3}`]->(y)
+            WITH DISTINCT x, y
+            WHERE NOT EXISTS {{ MATCH (x)-[:`{head_rel}`]->(y) }}
+              AND EXISTS {{ MATCH (x)-[:`{neg_rel}`]->(y) }}
+            RETURN count(*) AS conflict_count
+            """
+        else:
+            return 0
         with self._driver.session(database=self._database) as session:
             record = session.run(query).single()
             return int(record["conflict_count"]) if record else 0
 
     def list_conflict_cases_for_rule(self, rule: Rule, negative_relation: str, limit: int = 1000) -> list[ConflictCase]:
-        if len(rule.body_relations) != 2:
+        body_len = len(rule.body_relations)
+        if body_len not in (2, 3):
             return []
-        body_rel_1 = rule.body_relations[0].replace("`", "")
-        body_rel_2 = rule.body_relations[1].replace("`", "")
         head_rel = rule.head_relation.replace("`", "")
         neg_rel = negative_relation.replace("`", "")
-
-        query = f"""
-        MATCH (x)-[:`{body_rel_1}`]->(z)-[:`{body_rel_2}`]->(y)
-        WITH DISTINCT x, y
-        WHERE NOT EXISTS {{ MATCH (x)-[:`{head_rel}`]->(y) }}
-          AND EXISTS {{ MATCH (x)-[:`{neg_rel}`]->(y) }}
-        RETURN elementId(x) AS x_id, elementId(y) AS y_id
-        LIMIT $limit
-        """
+        if body_len == 2:
+            body_rel_1 = rule.body_relations[0].replace("`", "")
+            body_rel_2 = rule.body_relations[1].replace("`", "")
+            query = f"""
+            MATCH (x)-[:`{body_rel_1}`]->(z)-[:`{body_rel_2}`]->(y)
+            WITH DISTINCT x, y
+            WHERE NOT EXISTS {{ MATCH (x)-[:`{head_rel}`]->(y) }}
+              AND EXISTS {{ MATCH (x)-[:`{neg_rel}`]->(y) }}
+            RETURN elementId(x) AS x_id, elementId(y) AS y_id
+            LIMIT $limit
+            """
+        else:
+            body_rel_1 = rule.body_relations[0].replace("`", "")
+            body_rel_2 = rule.body_relations[1].replace("`", "")
+            body_rel_3 = rule.body_relations[2].replace("`", "")
+            query = f"""
+            MATCH (x)-[:`{body_rel_1}`]->(m1)-[:`{body_rel_2}`]->(m2)-[:`{body_rel_3}`]->(y)
+            WITH DISTINCT x, y
+            WHERE NOT EXISTS {{ MATCH (x)-[:`{head_rel}`]->(y) }}
+              AND EXISTS {{ MATCH (x)-[:`{neg_rel}`]->(y) }}
+            RETURN elementId(x) AS x_id, elementId(y) AS y_id
+            LIMIT $limit
+            """
         with self._driver.session(database=self._database) as session:
             rows = list(session.run(query, {"limit": limit}))
             result: list[ConflictCase] = []

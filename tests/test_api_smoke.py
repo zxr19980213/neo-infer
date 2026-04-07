@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 import neo_infer.api as api_module
-from neo_infer.models import ConflictCase, DeltaBatch, Rule
+from neo_infer.models import ChangeEdge, ConflictCase, DeltaBatch, Rule
 
 
 @pytest.fixture()
@@ -40,15 +40,10 @@ def client_and_state(monkeypatch: pytest.MonkeyPatch):
 
         def count_conflicts_for_rule(self, rule: Rule, negative_relation: str) -> int:
             rels = state["conflict_pairs"].get(rule.head_relation, set())
-            return 1 if negative_relation in rels else 0
-
-        def compute_length2_rule_metrics(self, r1: str, r2: str, head_rel: str) -> dict[str, int]:
-            _ = (r1, r2, head_rel)
-            return {"support": 5, "pca_denominator": 10, "head_count": 20}
-
-        def compute_length3_rule_metrics(self, r1: str, r2: str, r3: str, head_rel: str) -> dict[str, int]:
-            _ = (r1, r2, r3, head_rel)
-            return {"support": 4, "pca_denominator": 8, "head_count": 16}
+            base = 1 if negative_relation in rels else 0
+            if len(rule.body_relations) == 3:
+                return base + 1
+            return base
 
         def compute_length2_rule_metrics(self, r1: str, r2: str, head_rel: str) -> dict[str, int]:
             _ = (r1, r2, head_rel)
@@ -566,4 +561,69 @@ def test_incremental_length3_uses_incremental_candidates(client_and_state):
     assert "partOf" in payload["affected_relations"]
     assert payload["rules"]
     assert len(payload["rules"][0]["body_relations"]) == 3
+
+
+def test_length3_conflict_detection_consistency_smoke(client_and_state):
+    client, state = client_and_state
+    rule = Rule(
+        rule_id="rule__bornin__locatedin__partof__to__region",
+        body_relations=("bornIn", "locatedIn", "partOf"),
+        head_relation="region",
+        support=1,
+        pca_confidence=1.0,
+        head_coverage=1.0,
+        status="discovered",
+        version=1,
+    )
+    state["rules"][rule.rule_id] = rule
+    put_resp = client.put("/conflicts", json={"pairs": {"region": ["noRegion"]}})
+    assert put_resp.status_code == 200
+    client.post(f"/rules/{rule.rule_id}/adopt")
+    infer_resp = client.post(
+        "/inference/run",
+        json={"limit_rules": 10, "fixpoint": False, "check_conflicts": True},
+    )
+    assert infer_resp.status_code == 200
+    payload = infer_resp.json()
+    assert payload["total_conflicts"] >= 1
+
+
+def test_from_changelog_non_empty_mixed_and_idempotent_contract(client_and_state):
+    client, state = client_and_state
+    state.setdefault("stats", {})
+    state["delta"] = DeltaBatch(
+        added_edges=[ChangeEdge(src="n1", rel="bornIn", dst="n2")],
+        removed_edges=[ChangeEdge(src="n2", rel="locatedIn", dst="n3")],
+        cursor=5,
+    )
+    first = client.post(
+        "/rules/mine/incremental/from-changelog",
+        json={
+            "limit": 100,
+            "min_support": 1,
+            "min_pca_confidence": 0.0,
+            "body_length": 2,
+        },
+    )
+    assert first.status_code == 200
+    p1 = first.json()
+    assert p1["processed_changes"] == 2
+    assert sorted(p1["affected_relations"]) == ["bornIn", "locatedIn"]
+    assert isinstance(p1["rules"], list)
+
+    state["delta"] = DeltaBatch(added_edges=[], removed_edges=[], cursor=5)
+    second = client.post(
+        "/rules/mine/incremental/from-changelog",
+        json={
+            "limit": 100,
+            "min_support": 1,
+            "min_pca_confidence": 0.0,
+            "body_length": 2,
+        },
+    )
+    assert second.status_code == 200
+    p2 = second.json()
+    assert p2["processed_changes"] == 0
+    assert p2["affected_relations"] == []
+    assert p2["rules"] == []
 
