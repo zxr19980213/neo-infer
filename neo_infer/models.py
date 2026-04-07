@@ -102,6 +102,41 @@ class IncrementalMineRequest(MineRulesRequest):
     affected_relations: list[str] = Field(min_length=1)
 
 
+class EdgeItem(BaseModel):
+    src_id: str
+    relation: str
+    dst_id: str
+
+
+class ChangeLogAppendRequest(BaseModel):
+    added_edges: list[EdgeItem] = Field(default_factory=list)
+    removed_edges: list[EdgeItem] = Field(default_factory=list)
+
+
+class ChangeLogEntry(BaseModel):
+    change_id: str
+    op: str
+    src_id: str
+    relation: str
+    dst_id: str
+    created_at: str
+
+
+class ChangeLogPendingResponse(BaseModel):
+    pending_count: int
+    entries: list[ChangeLogEntry]
+
+
+class IncrementalConsumeRequest(MineRulesRequest):
+    change_limit: int = Field(default=1000, ge=1, le=20000)
+
+
+class IncrementalConsumeResponse(BaseModel):
+    processed_changes: int = Field(ge=0)
+    affected_relations: list[str]
+    rules: list[Rule]
+
+
 class ConflictCase(BaseModel):
     rule_id: str
     inferred_relation: str

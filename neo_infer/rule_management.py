@@ -103,3 +103,18 @@ class RuleStore:
         )
         return bool(rows and rows[0]["updated"] > 0)
 
+    def list_rule_ids_by_relations(self, relations: list[str]) -> list[str]:
+        if not relations:
+            return []
+        rows = self._client.run_read(
+            """
+            MATCH (r:Rule)
+            WHERE r.head_relation IN $rels
+               OR any(rel IN r.body_relations WHERE rel IN $rels)
+            RETURN r.rule_id AS rule_id
+            ORDER BY r.rule_id
+            """,
+            {"rels": relations},
+        )
+        return [str(row["rule_id"]) for row in rows]
+

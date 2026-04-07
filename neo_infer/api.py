@@ -5,8 +5,14 @@ from fastapi import Depends, FastAPI, HTTPException
 from neo_infer.config import Settings, get_settings, parse_conflict_relation_pairs
 from neo_infer.conflict_management import ConflictStore
 from neo_infer.db import Neo4jClient
+from neo_infer.incremental_mining import IncrementalMiner
+from neo_infer.incremental_store import IncrementalStore
 from neo_infer.inference import InferenceEngine
 from neo_infer.models import (
+    EdgeDelta,
+    EdgeDeltaApplyRequest,
+    EdgeDeltaApplyResponse,
+    EdgeDeltaBatch,
     ConflictCaseListResponse,
     IncrementalMineRequest,
     ConflictPairsResponse,
@@ -61,6 +67,62 @@ def mine_rules(
     return MineRulesResponse(rules=discovered)
 
 
+@app.post("/graph/edges/delta", response_model=EdgeDeltaApplyResponse)
+def apply_edge_deltas(
+    payload: EdgeDeltaApplyRequest,
+    settings: Settings = Depends(get_settings),
+    db: Neo4jClient = Depends(get_db),
+) -> EdgeDeltaApplyResponse:
+    store = IncrementalStore(db)
+    batch = EdgeDeltaBatch(
+        added_edges=[EdgeDelta(**item.model_dump()) for item in payload.added_edges],
+        removed_edges=[EdgeDelta(**item.model_dump()) for item in payload.removed_edges],
+        cursor=payload.cursor,
+    )
+    batch_id, added_count, removed_count = store.append_changelog(batch)
+
+    # 同步写图：新增用 MERGE，删除用 MATCH DELETE。该接口可作为增量入口。
+    if payload.added_edges:
+        db.run_write(
+            """
+            UNWIND $edges AS edge
+            MATCH (s) WHERE elementId(s) = edge.src_id
+            MATCH (t) WHERE elementId(t) = edge.dst_id
+            CALL {
+              WITH s, t, edge
+              WITH s, t, edge, replace(edge.rel, "`", "") AS rel
+              CALL apoc.create.relationship(s, rel, {}, t) YIELD rel AS created_rel
+              RETURN created_rel
+            }
+            RETURN count(*) AS updated
+            """,
+            {
+                "edges": [
+                    {"src_id": e.src_id, "dst_id": e.dst_id, "rel": e.rel}
+                    for e in payload.added_edges
+                ]
+            },
+        )
+    if payload.removed_edges:
+        # 不使用动态关系删除，退化为按两端节点和关系类型匹配。
+        for edge in payload.removed_edges:
+            rel = edge.rel.replace("`", "")
+            db.run_write(
+                f"""
+                MATCH (s)-[r:`{rel}`]->(t)
+                WHERE elementId(s) = $src_id AND elementId(t) = $dst_id
+                DELETE r
+                """,
+                {"src_id": edge.src_id, "dst_id": edge.dst_id},
+            )
+
+    return EdgeDeltaApplyResponse(
+        batch_id=batch_id,
+        added_count=added_count,
+        removed_count=removed_count,
+    )
+
+
 @app.post("/rules/mine/length3", response_model=MineRulesResponse)
 def mine_rules_length3(
     payload: MineRulesRequest,
@@ -92,20 +154,17 @@ def mine_rules_incremental_length2(
     db: Neo4jClient = Depends(get_db),
 ) -> MineRulesResponse:
     repo = QueryRepository(db.driver, database=settings.neo4j_database)
-    miner = RuleMiningService(repo)
-    config = MiningConfig(
+    store = RuleStore(db)
+    inc_store = IncrementalStore(db)
+    miner = IncrementalMiner(repo=repo, rule_store=store, inc_store=inc_store)
+    discovered = miner.run_incremental_length2(
         min_support=payload.min_support if payload.min_support is not None else settings.min_support,
         min_pca_confidence=(
-            payload.min_pca_confidence
-            if payload.min_pca_confidence is not None
-            else settings.min_confidence
+            payload.min_pca_confidence if payload.min_pca_confidence is not None else settings.min_confidence
         ),
         min_head_coverage=payload.min_head_coverage or 0.0,
         top_k=payload.limit,
-        candidate_limit=payload.candidate_limit or max(payload.limit * 20, 100),
     )
-    discovered = miner.mine_length2_rules_incremental(config, payload.affected_relations)
-    RuleStore(db).upsert_rules(discovered)
     return MineRulesResponse(rules=discovered)
 
 
@@ -116,20 +175,18 @@ def mine_rules_incremental_length3(
     db: Neo4jClient = Depends(get_db),
 ) -> MineRulesResponse:
     repo = QueryRepository(db.driver, database=settings.neo4j_database)
-    miner = RuleMiningService(repo)
-    config = MiningConfig(
+    store = RuleStore(db)
+    inc_store = IncrementalStore(db)
+    miner = IncrementalMiner(repo=repo, rule_store=store, inc_store=inc_store)
+    discovered = miner.run_incremental_length3(
         min_support=payload.min_support if payload.min_support is not None else settings.min_support,
         min_pca_confidence=(
-            payload.min_pca_confidence
-            if payload.min_pca_confidence is not None
-            else settings.min_confidence
+            payload.min_pca_confidence if payload.min_pca_confidence is not None else settings.min_confidence
         ),
         min_head_coverage=payload.min_head_coverage or 0.0,
         top_k=payload.limit,
-        candidate_limit=payload.candidate_limit or max(payload.limit * 20, 100),
+        fanout_cap=payload.fanout_cap or 1000,
     )
-    discovered = miner.mine_length3_rules_incremental(config, payload.affected_relations)
-    RuleStore(db).upsert_rules(discovered)
     return MineRulesResponse(rules=discovered)
 
 

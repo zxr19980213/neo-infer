@@ -64,6 +64,9 @@ pytest -q
 - `PUT /conflicts`
 - `GET /conflicts/cases?limit=100`
 - `POST /inference/run`
+- `POST /incremental/changelog/append`
+- `POST /incremental/mine/consume`
+- `GET /incremental/changelog/state`
 
 ## 推理接口说明（增强）
 `POST /inference/run` 支持冲突检测字段：
@@ -109,3 +112,28 @@ pytest -q
 
 - `rule_length`: `2` 或 `3`
 - `affected_relations`: 可选，增量重算入口；仅挖掘 body/head 涉及这些关系的候选规则
+
+## 真增量挖掘（ChangeLog 驱动）
+新增三个接口：
+
+1) 追加图变更日志：
+```bash
+curl -X POST http://127.0.0.1:8000/incremental/changelog/append \
+  -H "Content-Type: application/json" \
+  -d '{
+    "added_edges":[{"src_id":"1","dst_id":"2","rel":"bornIn"}],
+    "removed_edges":[]
+  }'
+```
+
+2) 消费日志并执行增量挖掘：
+```bash
+curl -X POST http://127.0.0.1:8000/incremental/mine/consume \
+  -H "Content-Type: application/json" \
+  -d '{"body_length":2,"limit":100,"min_support":1,"min_pca_confidence":0.1}'
+```
+
+3) 查看游标：
+```bash
+curl http://127.0.0.1:8000/incremental/changelog/state
+```

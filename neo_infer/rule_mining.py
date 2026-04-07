@@ -69,6 +69,51 @@ class RuleMiningService:
         head_counts = self._repository.head_relation_counts()
         return self._to_rules_from_candidates(raw_candidates, head_counts, config)
 
+    def build_rules_from_relation_triples(
+        self,
+        triples: list[tuple[str, str, str]],
+        config: MiningConfig,
+    ) -> list[Rule]:
+        if not triples:
+            return []
+
+        head_counts = self._repository.head_relation_counts()
+        rules: list[Rule] = []
+        seen: set[str] = set()
+        for r1, r2, head_rel in triples:
+            metrics = self._repository.compute_length2_rule_metrics(r1, r2, head_rel)
+            support = int(metrics.get("support", 0))
+            pca_denominator = int(metrics.get("pca_denominator", 0))
+            pca_confidence = float(support) / float(pca_denominator) if pca_denominator > 0 else 0.0
+            head_total = int(head_counts.get(head_rel, 0))
+            head_coverage = float(support) / float(head_total) if head_total > 0 else 0.0
+
+            if support < config.min_support:
+                continue
+            if pca_confidence < config.min_pca_confidence:
+                continue
+            if head_coverage < config.min_head_coverage:
+                continue
+
+            body_relations = (r1, r2)
+            rule = Rule(
+                rule_id=build_rule_id(body_relations, head_rel),
+                body_relations=body_relations,
+                head_relation=head_rel,
+                support=support,
+                pca_confidence=pca_confidence,
+                head_coverage=head_coverage,
+                status="discovered",
+                version=1,
+            )
+            if rule.rule_id in seen:
+                continue
+            seen.add(rule.rule_id)
+            rules.append(rule)
+
+        rules.sort(key=lambda x: (x.pca_confidence, x.support, x.head_coverage), reverse=True)
+        return rules[: config.top_k]
+
     def mine_length2_rules_incremental(
         self,
         config: MiningConfig,

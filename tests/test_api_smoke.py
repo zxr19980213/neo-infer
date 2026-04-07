@@ -130,6 +130,9 @@ def client_and_state(monkeypatch: pytest.MonkeyPatch):
             state["rules"][rule_id] = rule.model_copy(update={"version": rule.version + 1})
             return True
 
+        def replace_rules(self, rules: list[Rule]) -> None:
+            state["rules"] = {rule.rule_id: rule.model_copy(deep=True) for rule in rules}
+
     class FakeConflictStore:
         def __init__(self, db: FakeDB) -> None:
             _ = db
@@ -171,6 +174,96 @@ def client_and_state(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(api_module, "RuleMiningService", FakeRuleMiningService)
     monkeypatch.setattr(api_module, "RuleStore", FakeRuleStore)
     monkeypatch.setattr(api_module, "ConflictStore", FakeConflictStore)
+
+    class FakeDelta:
+        def __init__(self, op: str, src: str, rel: str, dst: str) -> None:
+            self.op = op
+            self.src = src
+            self.rel = rel
+            self.dst = dst
+
+    class FakeIncrementalStore:
+        def __init__(self, db: FakeDB) -> None:
+            _ = db
+            state.setdefault("changelog", [])
+            state.setdefault("cursor", 0)
+            state.setdefault("stats", {})
+
+        def append_changes(self, changes):
+            state["changelog"].extend(changes)
+
+        def fetch_unprocessed_changes(self):
+            idx = state["cursor"]
+            return state["changelog"][idx:]
+
+        def mark_changes_processed(self, count: int):
+            state["cursor"] += count
+
+        def set_rule_stats(self, rule_id: str, support: int, pca_denominator: int, head_count: int):
+            state["stats"][rule_id] = {
+                "support": support,
+                "pca_denominator": pca_denominator,
+                "head_count": head_count,
+            }
+
+        def get_rule_stats(self, rule_id: str):
+            return state["stats"].get(rule_id)
+
+        def clear_rule_stats(self):
+            state["stats"] = {}
+
+    class FakeIncrementalMiner:
+        def __init__(self, repository, rule_store, incremental_store) -> None:
+            _ = repository
+            _ = rule_store
+            _ = incremental_store
+
+        def consume_changelog_length2(self, config):
+            _ = config
+            # 模拟：消费日志后返回一个规则
+            return [
+                Rule(
+                    rule_id="rule__bornin__locatedin__to__nationality",
+                    body_relations=("bornIn", "locatedIn"),
+                    head_relation="nationality",
+                    support=3,
+                    pca_confidence=1.0,
+                    head_coverage=1.0,
+                    status="discovered",
+                    version=1,
+                )
+            ]
+
+        def consume_changelog_length3(self, config):
+            _ = config
+            return [
+                Rule(
+                    rule_id="rule__bornin__locatedin__partof__to__region",
+                    body_relations=("bornIn", "locatedIn", "partOf"),
+                    head_relation="region",
+                    support=2,
+                    pca_confidence=1.0,
+                    head_coverage=1.0,
+                    status="discovered",
+                    version=1,
+                )
+            ]
+
+        def discover_new_rules_from_delta_length2(self, config):
+            _ = config
+            return []
+
+        def discover_new_rules_from_delta_length3(self, config):
+            _ = config
+            return []
+
+    monkeypatch.setattr(api_module, "IncrementalStore", FakeIncrementalStore)
+    monkeypatch.setattr(api_module, "IncrementalMiner", FakeIncrementalMiner)
+    monkeypatch.setattr(
+        api_module,
+        "DeltaEdge",
+        FakeDelta,
+    )
     api_module.app.dependency_overrides[api_module.get_db] = lambda: FakeDB()
 
     with TestClient(api_module.app) as client:
@@ -271,4 +364,57 @@ def test_conflicts_and_conflict_cases_smoke(client_and_state):
     alias_resp = client.get("/conflict-cases", params={"limit": 50})
     assert alias_resp.status_code == 200
     assert len(alias_resp.json()["cases"]) >= 1
+
+
+def test_true_incremental_mining_from_changelog_smoke(client_and_state):
+    client, _state = client_and_state
+    # 先确保已有规则注册，便于增量更新命中 relation_to_rules。
+    mine_resp = client.post(
+        "/rules/mine",
+        json={"body_length": 2, "limit": 10, "min_support": 1, "min_pca_confidence": 0.1},
+    )
+    assert mine_resp.status_code == 200
+
+    # 记录新增边到 changelog
+    log_resp = client.post(
+        "/changes/log",
+        json={
+            "added_edges": [
+                {"src_id": "n1", "rel": "bornIn", "dst_id": "n2"},
+                {"src_id": "n2", "rel": "locatedIn", "dst_id": "n3"},
+            ],
+            "removed_edges": [],
+        },
+    )
+    assert log_resp.status_code == 200
+    assert log_resp.json()["added"] == 2
+
+    run_resp = client.post(
+        "/rules/mine/incremental/changelog",
+        json={"body_length": 2, "limit": 50, "min_support": 1, "min_pca_confidence": 0.0},
+    )
+    assert run_resp.status_code == 200
+    payload = run_resp.json()
+    assert "rules" in payload
+
+def test_incremental_changelog_flow_smoke(client_and_state):
+    client, _state = client_and_state
+    append_resp = client.post(
+        "/changelog/append",
+        json={
+            "changes": [
+                {"op": "add", "src": "n1", "rel": "bornIn", "dst": "n2"},
+                {"op": "add", "src": "n2", "rel": "locatedIn", "dst": "n3"},
+            ]
+        },
+    )
+    assert append_resp.status_code == 200
+    assert append_resp.json()["appended"] == 2
+
+    run_resp = client.post(
+        "/rules/mine/incremental/consume/length2",
+        json={"limit": 50, "min_support": 1, "min_pca_confidence": 0.1},
+    )
+    assert run_resp.status_code == 200
+    assert run_resp.json()["rules"]
 
