@@ -112,6 +112,59 @@ class QueryRepository:
                 )
             return candidates
 
+    def length2_path_rule_candidates_incremental(
+        self,
+        limit: int,
+        affected_relations: list[str],
+    ) -> list[PathRuleCandidate]:
+        touched = [rel.strip().replace("`", "") for rel in affected_relations if rel.strip()]
+        if not touched:
+            return []
+
+        phase1_query = """
+        MATCH (x)-[a]->(z)-[b]->(y)
+        WITH type(a) AS r1, type(b) AS r2, x, y
+        MATCH (x)-[h]->(y)
+        WITH r1, r2, type(h) AS r3, collect(DISTINCT [x, y]) AS pairs
+        WHERE r1 IN $rels OR r2 IN $rels OR r3 IN $rels
+        RETURN r1, r2, r3, size(pairs) AS support
+        ORDER BY support DESC
+        LIMIT $limit
+        """
+
+        with self._driver.session(database=self._database) as session:
+            phase1_records = list(session.run(phase1_query, {"limit": limit, "rels": touched}))
+            candidates: list[PathRuleCandidate] = []
+            denominator_cache: dict[tuple[str, str, str], int] = {}
+
+            for record in phase1_records:
+                r1 = str(record["r1"])
+                r2 = str(record["r2"])
+                r3 = str(record["r3"])
+                support = int(record["support"])
+                key = (r1, r2, r3)
+
+                if key not in denominator_cache:
+                    escaped_r3 = r3.replace("`", "")
+                    pca_query = f"""
+                    MATCH (x)-[a]->(z)-[b]->(y)
+                    WHERE type(a) = $r1 AND type(b) = $r2
+                      AND EXISTS {{ MATCH (x)-[:`{escaped_r3}`]->() }}
+                    RETURN count(DISTINCT [x, y]) AS pca_denominator
+                    """
+                    pca_record = session.run(pca_query, {"r1": r1, "r2": r2}).single()
+                    denominator_cache[key] = int(pca_record["pca_denominator"]) if pca_record else 0
+
+                candidates.append(
+                    PathRuleCandidate(
+                        body_relations=(r1, r2),
+                        head_relation=r3,
+                        support=support,
+                        pca_denominator=denominator_cache[key],
+                    )
+                )
+            return candidates
+
     def length3_path_rule_candidates(self, limit: int = 5000) -> list[PathRuleCandidate]:
         # 规则模板：r1(X,A) ∧ r2(A,B) ∧ r3(B,Y) -> h(X,Y)
         phase1_query = """
