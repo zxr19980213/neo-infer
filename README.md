@@ -32,6 +32,7 @@ PLAN                 # 总体实施计划
 - `MIN_SUPPORT`（默认 `5`）
 - `MIN_CONFIDENCE`（默认 `0.1`）
 - `MAX_RULE_LENGTH`（默认 `2`）
+- `INFERENCE_CONFLICT_RELATION`（可选，冲突关系名，例如 `notNationality`）
 
 ## 运行
 ```bash
@@ -46,3 +47,21 @@ uvicorn main:app --reload
 - `POST /rules/{rule_id}/adopt`
 - `POST /rules/{rule_id}/reject`
 - `POST /inference/run`
+
+## 推理接口说明（增强）
+`POST /inference/run` 支持冲突检测字段：
+
+```json
+{
+  "limit_rules": 100,
+  "fixpoint": false,
+  "max_iterations": 5,
+  "conflict_relation": "notNationality"
+}
+```
+
+- 若设置了 `conflict_relation`，系统会在推理前检测：
+  - body 匹配产生的 `(X,Y)` 中，已有 `X-[:conflict_relation]->Y` 的候选对
+- 这些候选将被统计为冲突并跳过，不会创建 head 边
+- 响应中新增：
+  - `conflicts_detected`：冲突数量

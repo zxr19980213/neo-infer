@@ -116,3 +116,25 @@ class QueryRepository:
                 {"rule_id": rule.rule_id, "confidence": rule.pca_confidence},
             ).single()
             return int(record["created_count"]) if record else 0
+
+    def count_conflicts_for_rule(
+        self,
+        rule: Rule,
+        negative_relation: str,
+    ) -> int:
+        """Count candidate inferred pairs that already have a negative relation."""
+        body_r1 = rule.body_relations[0].replace("`", "")
+        body_r2 = rule.body_relations[1].replace("`", "")
+        head_r3 = rule.head_relation.replace("`", "")
+        neg_rel = negative_relation.replace("`", "")
+
+        query = f"""
+        MATCH (x)-[:`{body_r1}`]->(z)-[:`{body_r2}`]->(y)
+        WITH DISTINCT x, y
+        WHERE NOT EXISTS {{ MATCH (x)-[:`{head_r3}`]->(y) }}
+          AND EXISTS {{ MATCH (x)-[:`{neg_rel}`]->(y) }}
+        RETURN count(*) AS conflict_count
+        """
+        with self._driver.session(database=self._database) as session:
+            record = session.run(query).single()
+            return int(record["conflict_count"]) if record else 0

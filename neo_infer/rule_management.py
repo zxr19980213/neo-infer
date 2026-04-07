@@ -31,14 +31,18 @@ class RuleStore:
             """
             UNWIND $rules AS rule
             MERGE (r:Rule {rule_id: rule.rule_id})
+            ON CREATE SET r.status = rule.status,
+                          r.version = rule.version
             SET r.body_relations = rule.body_relations,
                 r.head_relation = rule.head_relation,
                 r.support = rule.support,
                 r.pca_confidence = rule.pca_confidence,
                 r.head_coverage = rule.head_coverage,
                 r.rule_text = rule.rule_text,
-                r.status = rule.status,
-                r.version = rule.version
+                r.version = CASE
+                  WHEN r.status IN ['adopted', 'applied', 'rejected'] THEN coalesce(r.version, 1) + 1
+                  ELSE coalesce(r.version, 1)
+                END
             """,
             {"rules": payload},
         )

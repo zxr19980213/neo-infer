@@ -88,7 +88,7 @@ def run_inference(
 ) -> InferenceResponse:
     repo = QueryRepository(db.driver, database=settings.neo4j_database)
     store = RuleStore(db)
-    engine = InferenceEngine(repo, store)
+    engine = InferenceEngine(repo, store, conflict_relation=settings.conflict_relation)
 
     if payload.fixpoint:
         results = engine.run_fixpoint(max_iterations=payload.max_iterations, limit_rules=payload.limit_rules)

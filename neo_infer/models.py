@@ -54,6 +54,7 @@ class RuleSetResponse(BaseModel):
 class ApplyRuleResult(BaseModel):
     rule_id: str
     created_triples: int = Field(ge=0)
+    conflict_triples: int = Field(default=0, ge=0)
     iteration: int = Field(ge=1)
 
 
