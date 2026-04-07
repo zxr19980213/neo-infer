@@ -63,6 +63,9 @@ class InferenceRequest(BaseModel):
     fixpoint: bool = False
     max_iterations: int = Field(default=5, ge=1, le=100)
     check_conflicts: bool = True
+    # 可选：请求级冲突策略，优先级最高。
+    # 例如 {"nationality": ["noNationality"]}。
+    conflict_pairs: dict[str, list[str]] | None = None
 
 
 class InferenceResponse(BaseModel):
@@ -70,4 +73,12 @@ class InferenceResponse(BaseModel):
     total_created: int = Field(ge=0)
     total_conflicts: int = Field(default=0, ge=0)
     iterations_run: int = Field(ge=0)
+
+
+class ConflictPairsResponse(BaseModel):
+    pairs: dict[str, list[str]]
+
+
+class ConflictPairsUpdateRequest(BaseModel):
+    pairs: dict[str, list[str]]
 

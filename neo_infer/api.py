@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 
 from neo_infer.config import Settings, get_settings, parse_conflict_relation_pairs
+from neo_infer.conflict_management import ConflictStore
 from neo_infer.db import Neo4jClient
 from neo_infer.inference import InferenceEngine
 from neo_infer.models import (
+    ConflictPairsResponse,
+    ConflictPairsUpdateRequest,
     InferenceRequest,
     InferenceResponse,
     MineRulesRequest,
@@ -80,6 +83,53 @@ def reject_rule(rule_id: str, db: Neo4jClient = Depends(get_db)) -> dict[str, st
     return {"status": "rejected", "rule_id": rule_id}
 
 
+@app.get("/conflicts", response_model=ConflictPairsResponse)
+def list_conflict_pairs(db: Neo4jClient = Depends(get_db)) -> ConflictPairsResponse:
+    store = ConflictStore(db)
+    pairs = {k: sorted(v) for k, v in store.list_pairs().items()}
+    return ConflictPairsResponse(pairs=pairs)
+
+
+@app.put("/conflicts", response_model=ConflictPairsResponse)
+def replace_conflict_pairs(
+    payload: ConflictPairsUpdateRequest,
+    db: Neo4jClient = Depends(get_db),
+) -> ConflictPairsResponse:
+    store = ConflictStore(db)
+    store.replace_pairs(payload.pairs)
+    pairs = {k: sorted(v) for k, v in store.list_pairs().items()}
+    return ConflictPairsResponse(pairs=pairs)
+
+
+@app.post("/conflicts", response_model=ConflictPairsResponse)
+def add_conflict_pair(
+    payload: ConflictPairsUpdateRequest,
+    db: Neo4jClient = Depends(get_db),
+) -> ConflictPairsResponse:
+    store = ConflictStore(db)
+    for inferred_rel, conflict_list in payload.pairs.items():
+        for conflict_rel in conflict_list:
+            store.upsert_pair(inferred_rel, conflict_rel)
+    pairs = {k: sorted(v) for k, v in store.list_pairs().items()}
+    return ConflictPairsResponse(pairs=pairs)
+
+
+@app.delete("/conflicts/{inferred_relation}/{conflicting_relation}")
+def delete_conflict_pair(
+    inferred_relation: str,
+    conflicting_relation: str,
+    db: Neo4jClient = Depends(get_db),
+) -> dict[str, str]:
+    deleted = ConflictStore(db).delete_pair(inferred_relation, conflicting_relation)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="conflict pair not found")
+    return {
+        "status": "deleted",
+        "inferred_relation": inferred_relation,
+        "conflicting_relation": conflicting_relation,
+    }
+
+
 @app.post("/inference/run", response_model=InferenceResponse)
 def run_inference(
     payload: InferenceRequest,
@@ -88,7 +138,16 @@ def run_inference(
 ) -> InferenceResponse:
     repo = QueryRepository(db.driver, database=settings.neo4j_database)
     store = RuleStore(db)
-    conflict_pairs = parse_conflict_relation_pairs(settings.conflict_relation_pairs)
+    conflict_store = ConflictStore(db)
+    # 优先读取数据库配置；若未配置则回退到环境变量，保证向后兼容。
+    conflict_pairs = conflict_store.list_pairs()
+    if not conflict_pairs:
+        conflict_pairs = parse_conflict_relation_pairs(settings.conflict_relation_pairs)
+    if payload.conflict_pairs:
+        conflict_pairs = {
+            inferred_rel: {item for item in conflict_list}
+            for inferred_rel, conflict_list in payload.conflict_pairs.items()
+        }
     engine = InferenceEngine(repo, store, conflict_pairs=conflict_pairs)
 
     if payload.fixpoint:

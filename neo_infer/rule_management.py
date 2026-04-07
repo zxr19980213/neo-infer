@@ -92,3 +92,14 @@ class RuleStore:
         )
         return bool(rows and rows[0]["updated"] > 0)
 
+    def bump_rule_version(self, rule_id: str) -> bool:
+        rows = self._client.run_write(
+            """
+            MATCH (r:Rule {rule_id: $rule_id})
+            SET r.version = coalesce(r.version, 1) + 1
+            RETURN count(r) AS updated
+            """,
+            {"rule_id": rule_id},
+        )
+        return bool(rows and rows[0]["updated"] > 0)
+

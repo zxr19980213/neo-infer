@@ -18,16 +18,16 @@ class InferenceEngine:
         self,
         query_repo: QueryRepository,
         rule_store: RuleStore,
-        conflict_relation_pairs: dict[str, set[str]] | None = None,
+        conflict_pairs: dict[str, set[str]] | None = None,
     ) -> None:
         self.query_repo = query_repo
         self.rule_store = rule_store
-        self.conflict_relation_pairs = conflict_relation_pairs or {}
+        self.conflict_rule_map: dict[str, set[str]] = conflict_pairs or {}
 
     def _count_conflicts_for_rule(self, rule, check_conflicts: bool) -> int:
         if not check_conflicts:
             return 0
-        conflict_relations = self.conflict_relation_pairs.get(rule.head_relation, set())
+        conflict_relations = self.conflict_rule_map.get(rule.head_relation, set())
         total = 0
         for negative_relation in conflict_relations:
             total += self.query_repo.count_conflicts_for_rule(rule, negative_relation)

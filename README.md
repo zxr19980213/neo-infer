@@ -32,7 +32,7 @@ PLAN                 # 总体实施计划
 - `MIN_SUPPORT`（默认 `5`）
 - `MIN_CONFIDENCE`（默认 `0.1`）
 - `MAX_RULE_LENGTH`（默认 `2`）
-- `INFERENCE_CONFLICT_RELATION`（可选，冲突关系名，例如 `notNationality`）
+- `CONFLICT_RELATION_PAIRS`（可选兜底配置，格式：`headRel:conflictRel,relA:relB`）
 
 ## 运行
 ```bash
@@ -46,6 +46,8 @@ uvicorn main:app --reload
 - `GET /rules?status=discovered&limit=100`
 - `POST /rules/{rule_id}/adopt`
 - `POST /rules/{rule_id}/reject`
+- `GET /conflicts`
+- `PUT /conflicts`
 - `POST /inference/run`
 
 ## 推理接口说明（增强）
@@ -56,12 +58,18 @@ uvicorn main:app --reload
   "limit_rules": 100,
   "fixpoint": false,
   "max_iterations": 5,
-  "conflict_relation": "notNationality"
+  "check_conflicts": true,
+  "conflict_pairs": {
+    "nationality": ["noNationality"]
+  }
 }
 ```
 
-- 若设置了 `conflict_relation`，系统会在推理前检测：
-  - body 匹配产生的 `(X,Y)` 中，已有 `X-[:conflict_relation]->Y` 的候选对
-- 这些候选将被统计为冲突并跳过，不会创建 head 边
-- 响应中新增：
-  - `conflicts_detected`：冲突数量
+- 冲突策略优先级：
+  1) 请求体 `conflict_pairs`
+  2) 数据库 `ConflictRule`（通过 `/conflicts` 管理）
+  3) 环境变量 `CONFLICT_RELATION_PAIRS`（兼容兜底）
+- 对每条待推理规则，若候选 `(X,Y)` 同时存在冲突关系，则计入冲突统计。
+- 响应中会返回：
+  - `results[].conflict_triples`
+  - `total_conflicts`
