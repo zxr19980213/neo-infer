@@ -1,0 +1,2 @@
+"""neo_infer package."""
+
