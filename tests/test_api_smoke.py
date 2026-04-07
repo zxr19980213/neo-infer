@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 import neo_infer.api as api_module
-from neo_infer.models import ConflictCase, Rule
+from neo_infer.models import ConflictCase, DeltaBatch, Rule
 
 
 @pytest.fixture()
@@ -189,6 +189,10 @@ def client_and_state(monkeypatch: pytest.MonkeyPatch):
             state.setdefault("cursor", 0)
             state.setdefault("stats", {})
 
+        def consume_delta(self, limit: int = 2000) -> DeltaBatch:
+            _ = limit
+            return DeltaBatch(added_edges=[], removed_edges=[], cursor=int(state.get("cursor", 0)))
+
         def append_changes(self, changes):
             state["changelog"].extend(changes)
 
@@ -258,12 +262,14 @@ def client_and_state(monkeypatch: pytest.MonkeyPatch):
             return []
 
     monkeypatch.setattr(api_module, "IncrementalStore", FakeIncrementalStore)
-    monkeypatch.setattr(api_module, "IncrementalMiner", FakeIncrementalMiner)
-    monkeypatch.setattr(
-        api_module,
-        "DeltaEdge",
-        FakeDelta,
-    )
+    if hasattr(api_module, "IncrementalMiner"):
+        monkeypatch.setattr(api_module, "IncrementalMiner", FakeIncrementalMiner)
+    if hasattr(api_module, "DeltaEdge"):
+        monkeypatch.setattr(
+            api_module,
+            "DeltaEdge",
+            FakeDelta,
+        )
     api_module.app.dependency_overrides[api_module.get_db] = lambda: FakeDB()
 
     with TestClient(api_module.app) as client:
@@ -417,4 +423,17 @@ def test_incremental_changelog_flow_smoke(client_and_state):
     )
     assert run_resp.status_code == 200
     assert run_resp.json()["rules"]
+
+
+def test_incremental_from_changelog_empty_delta_contract(client_and_state):
+    client, _state = client_and_state
+    resp = client.post(
+        "/rules/mine/incremental/from-changelog",
+        json={"limit": 100, "min_support": 1, "min_pca_confidence": 0.1, "body_length": 2},
+    )
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["processed_changes"] == 0
+    assert payload["affected_relations"] == []
+    assert payload["rules"] == []
 

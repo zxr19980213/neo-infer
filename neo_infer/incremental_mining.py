@@ -13,6 +13,7 @@ class IncrementalRunResult:
     rules: list[Rule]
     processed_events: int
     last_event_id: int
+    affected_relations: list[str]
 
 
 class IncrementalMiningService:
@@ -46,7 +47,12 @@ class IncrementalMiningService:
 
         # No change since last cursor: return empty result quickly.
         if not affected_relations:
-            return IncrementalRunResult(rules=[], processed_events=0, last_event_id=delta.cursor)
+            return IncrementalRunResult(
+                rules=[],
+                processed_events=0,
+                last_event_id=delta.cursor,
+                affected_relations=[],
+            )
 
         config = MiningConfig(
             min_support=request.min_support if request.min_support is not None else 0,
@@ -70,6 +76,7 @@ class IncrementalMiningService:
             rules=discovered,
             processed_events=len(events),
             last_event_id=delta.cursor,
+            affected_relations=affected_relations,
         )
 
 
