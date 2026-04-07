@@ -23,13 +23,17 @@ class RuleMiningService:
 
     def mine_length2_rules(self, config: MiningConfig) -> list[Rule]:
         raw_candidates = self._repository.length2_path_rule_candidates(limit=config.candidate_limit)
+        head_counts = self._repository.head_relation_counts()
         rules: list[Rule] = []
         for candidate in raw_candidates:
+            head_total = int(head_counts.get(candidate.head_r3, 0))
+            head_coverage = float(candidate.support) / float(head_total) if head_total > 0 else 0.0
+
             if candidate.support < config.min_support:
                 continue
             if candidate.pca_confidence < config.min_pca_confidence:
                 continue
-            if candidate.head_coverage < config.min_head_coverage:
+            if head_coverage < config.min_head_coverage:
                 continue
             body_relations = (candidate.body_r1, candidate.body_r2)
             rules.append(
@@ -39,7 +43,7 @@ class RuleMiningService:
                     head_relation=candidate.head_r3,
                     support=candidate.support,
                     pca_confidence=candidate.pca_confidence,
-                    head_coverage=candidate.head_coverage,
+                    head_coverage=head_coverage,
                     status="discovered",
                     version=1,
                 )
