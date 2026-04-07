@@ -9,6 +9,7 @@ from neo_infer.incremental_mining import IncrementalMiningService
 from neo_infer.incremental_store import IncrementalStore
 from neo_infer.inference import InferenceEngine
 from neo_infer.models import (
+    ChangeEdge,
     ChangeLogAppendRequest,
     ChangeLogPendingResponse,
     IncrementalConsumeRequest,
@@ -75,15 +76,15 @@ def append_changes(
 ) -> ChangeLogPendingResponse:
     _ = settings
     store = IncrementalStore(db)
+    def _edge_from_item(item, default_rel: str = "") -> ChangeEdge:
+        src = getattr(item, "src", None) or getattr(item, "src_id", None) or ""
+        rel = getattr(item, "rel", None) or getattr(item, "relation", None) or default_rel
+        dst = getattr(item, "dst", None) or getattr(item, "dst_id", None) or ""
+        return ChangeEdge(src=str(src), rel=str(rel), dst=str(dst))
+
     store.append_changes(
-        added_edges=[
-            item.to_change_edge("added")
-            for item in payload.added_edges
-        ],
-        removed_edges=[
-            item.to_change_edge("removed")
-            for item in payload.removed_edges
-        ],
+        added_edges=[_edge_from_item(item) for item in payload.added_edges],
+        removed_edges=[_edge_from_item(item) for item in payload.removed_edges],
     )
     pending = store.pending_changes(limit=1000)
     return ChangeLogPendingResponse(
