@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from neo_infer.db import Neo4jClient
-from neo_infer.models import ChangeEdge, DeltaBatch, EdgeDeltaBatch, Rule
+from neo_infer.models import ChangeEdge, ChangeLogEntry, DeltaBatch, EdgeDeltaBatch, Rule
 
 
 @dataclass(frozen=True)
@@ -131,6 +131,35 @@ class IncrementalStore:
         events.extend(delta.added_edges)
         events.extend(delta.removed_edges)
         return events, delta.cursor
+
+    def pending_changes(self, limit: int = 1000) -> list[ChangeLogEntry]:
+        cursor = self.get_cursor()
+        rows = self._client.run_read(
+            """
+            MATCH (c:ChangeLog)
+            WHERE id(c) > $cursor
+            RETURN toString(id(c)) AS change_id,
+                   c.event_type AS op,
+                   c.src AS src_id,
+                   c.rel AS relation,
+                   c.dst AS dst_id,
+                   toString(c.created_at) AS created_at
+            ORDER BY id(c) ASC
+            LIMIT $limit
+            """,
+            {"cursor": cursor, "limit": int(limit)},
+        )
+        return [
+            ChangeLogEntry(
+                change_id=str(row["change_id"]),
+                op=str(row["op"]),
+                src_id=str(row["src_id"]),
+                relation=str(row["relation"]),
+                dst_id=str(row["dst_id"]),
+                created_at=str(row["created_at"]),
+            )
+            for row in rows
+        ]
 
     def upsert_rule_stats(self, rule: Rule, support: int, pca_denominator: int, head_count: int) -> None:
         self._client.run_write(
