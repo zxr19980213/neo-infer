@@ -33,26 +33,27 @@ class RuleMiningService:
             return self.mine_length2_rules_incremental(config, config.changed_relations)
         return self.mine_length2_rules(config)
 
-    def mine_length2_rules(self, config: MiningConfig) -> list[Rule]:
-        raw_candidates = self._repository.length2_path_rule_candidates(limit=config.candidate_limit)
-        head_counts = self._repository.head_relation_counts()
+    @staticmethod
+    def _to_rules_from_candidates(
+        candidates,
+        head_counts: dict[str, int],
+        config: MiningConfig,
+    ) -> list[Rule]:
         rules: list[Rule] = []
-        for candidate in raw_candidates:
-            head_total = int(head_counts.get(candidate.head_r3, 0))
+        for candidate in candidates:
+            head_total = int(head_counts.get(candidate.head_relation, 0))
             head_coverage = float(candidate.support) / float(head_total) if head_total > 0 else 0.0
-
             if candidate.support < config.min_support:
                 continue
             if candidate.pca_confidence < config.min_pca_confidence:
                 continue
             if head_coverage < config.min_head_coverage:
                 continue
-            body_relations = (candidate.body_r1, candidate.body_r2)
             rules.append(
                 Rule(
-                    rule_id=build_rule_id(body_relations, candidate.head_r3),
-                    body_relations=body_relations,
-                    head_relation=candidate.head_r3,
+                    rule_id=build_rule_id(candidate.body_relations, candidate.head_relation),
+                    body_relations=candidate.body_relations,
+                    head_relation=candidate.head_relation,
                     support=candidate.support,
                     pca_confidence=candidate.pca_confidence,
                     head_coverage=head_coverage,
@@ -62,6 +63,11 @@ class RuleMiningService:
             )
         rules.sort(key=lambda x: (x.pca_confidence, x.support, x.head_coverage), reverse=True)
         return rules[: config.top_k]
+
+    def mine_length2_rules(self, config: MiningConfig) -> list[Rule]:
+        raw_candidates = self._repository.length2_path_rule_candidates(limit=config.candidate_limit)
+        head_counts = self._repository.head_relation_counts()
+        return self._to_rules_from_candidates(raw_candidates, head_counts, config)
 
     def mine_length2_rules_incremental(
         self,
@@ -77,31 +83,7 @@ class RuleMiningService:
             affected_relations=normalized,
         )
         head_counts = self._repository.head_relation_counts()
-        rules: list[Rule] = []
-        for candidate in raw_candidates:
-            head_total = int(head_counts.get(candidate.head_r3, 0))
-            head_coverage = float(candidate.support) / float(head_total) if head_total > 0 else 0.0
-            if candidate.support < config.min_support:
-                continue
-            if candidate.pca_confidence < config.min_pca_confidence:
-                continue
-            if head_coverage < config.min_head_coverage:
-                continue
-            body_relations = (candidate.body_r1, candidate.body_r2)
-            rules.append(
-                Rule(
-                    rule_id=build_rule_id(body_relations, candidate.head_r3),
-                    body_relations=body_relations,
-                    head_relation=candidate.head_r3,
-                    support=candidate.support,
-                    pca_confidence=candidate.pca_confidence,
-                    head_coverage=head_coverage,
-                    status="discovered",
-                    version=1,
-                )
-            )
-        rules.sort(key=lambda x: (x.pca_confidence, x.support, x.head_coverage), reverse=True)
-        return rules[: config.top_k]
+        return self._to_rules_from_candidates(raw_candidates, head_counts, config)
 
     def mine_length3_rules_incremental(
         self,
@@ -124,28 +106,4 @@ class RuleMiningService:
     def mine_length3_rules(self, config: MiningConfig) -> list[Rule]:
         raw_candidates = self._repository.length3_path_rule_candidates(limit=config.candidate_limit)
         head_counts = self._repository.head_relation_counts()
-        rules: list[Rule] = []
-        for candidate in raw_candidates:
-            head_total = int(head_counts.get(candidate.head_r4, 0))
-            head_coverage = float(candidate.support) / float(head_total) if head_total > 0 else 0.0
-            if candidate.support < config.min_support:
-                continue
-            if candidate.pca_confidence < config.min_pca_confidence:
-                continue
-            if head_coverage < config.min_head_coverage:
-                continue
-            body_relations = (candidate.body_r1, candidate.body_r2, candidate.body_r3)
-            rules.append(
-                Rule(
-                    rule_id=build_rule_id(body_relations, candidate.head_r4),
-                    body_relations=body_relations,
-                    head_relation=candidate.head_r4,
-                    support=candidate.support,
-                    pca_confidence=candidate.pca_confidence,
-                    head_coverage=head_coverage,
-                    status="discovered",
-                    version=1,
-                )
-            )
-        rules.sort(key=lambda x: (x.pca_confidence, x.support, x.head_coverage), reverse=True)
-        return rules[: config.top_k]
+        return self._to_rules_from_candidates(raw_candidates, head_counts, config)

@@ -106,8 +106,8 @@ class ConflictCase(BaseModel):
     rule_id: str
     inferred_relation: str
     conflicting_relation: str
-    source_id: str
-    target_id: str
+    source_x: str
+    source_y: str
     detect_count: int = Field(ge=0)
     first_iteration: int = Field(ge=1)
     last_iteration: int = Field(ge=1)
@@ -115,4 +115,8 @@ class ConflictCase(BaseModel):
 
 class ConflictCaseListResponse(BaseModel):
     cases: list[ConflictCase]
+
+
+# Backward-compatible alias.
+ConflictCasesResponse = ConflictCaseListResponse
 

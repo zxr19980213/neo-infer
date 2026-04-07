@@ -179,6 +179,30 @@ class QueryRepository:
             ).single()
             return int(record["created_count"]) if record else 0
 
+    def apply_length3_rule(self, rule: Rule) -> int:
+        body_r1 = rule.body_relations[0].replace("`", "")
+        body_r2 = rule.body_relations[1].replace("`", "")
+        body_r3 = rule.body_relations[2].replace("`", "")
+        head_r4 = rule.head_relation.replace("`", "")
+
+        query = f"""
+        MATCH (x)-[:`{body_r1}`]->(m1)-[:`{body_r2}`]->(m2)-[:`{body_r3}`]->(y)
+        WITH DISTINCT x, y
+        WHERE NOT EXISTS {{ MATCH (x)-[:`{head_r4}`]->(y) }}
+        MERGE (x)-[h:`{head_r4}`]->(y)
+        ON CREATE SET h.is_inferred = true,
+                      h.source_rule_id = $rule_id,
+                      h.rule_confidence = $confidence,
+                      h.inferred_at = datetime()
+        RETURN count(h) AS created_count
+        """
+        with self._driver.session(database=self._database) as session:
+            record = session.run(
+                query,
+                {"rule_id": rule.rule_id, "confidence": rule.pca_confidence},
+            ).single()
+            return int(record["created_count"]) if record else 0
+
     def count_conflicts_for_rule(
         self,
         rule: Rule,
@@ -202,6 +226,8 @@ class QueryRepository:
             return int(record["conflict_count"]) if record else 0
 
     def list_conflict_cases_for_rule(self, rule: Rule, negative_relation: str, limit: int = 1000) -> list[ConflictCase]:
+        if len(rule.body_relations) != 2:
+            return []
         body_rel_1 = rule.body_relations[0].replace("`", "")
         body_rel_2 = rule.body_relations[1].replace("`", "")
         head_rel = rule.head_relation.replace("`", "")
@@ -222,10 +248,13 @@ class QueryRepository:
                 result.append(
                     ConflictCase(
                         rule_id=rule.rule_id,
-                        x_id=str(row["x_id"]),
-                        y_id=str(row["y_id"]),
                         inferred_relation=rule.head_relation,
                         conflicting_relation=negative_relation,
+                        source_x=str(row["x_id"]),
+                        source_y=str(row["y_id"]),
+                        detect_count=1,
+                        first_iteration=1,
+                        last_iteration=1,
                     )
                 )
             return result

@@ -7,7 +7,7 @@ from neo_infer.conflict_management import ConflictStore
 from neo_infer.db import Neo4jClient
 from neo_infer.inference import InferenceEngine
 from neo_infer.models import (
-    ConflictCasesResponse,
+    ConflictCaseListResponse,
     IncrementalMineRequest,
     ConflictPairsResponse,
     ConflictPairsUpdateRequest,
@@ -52,7 +52,7 @@ def mine_rules(
         top_k=payload.limit,
         candidate_limit=payload.candidate_limit or max(payload.limit * 20, 100),
     )
-    if payload.max_body_length == 3:
+    if payload.body_length == 3:
         discovered = miner.mine_length3_rules(config)
     else:
         discovered = miner.mine_length2_rules(config)
@@ -206,10 +206,10 @@ def delete_conflict_pair(
     }
 
 
-@app.get("/conflicts/cases", response_model=ConflictCasesResponse)
-def list_conflict_cases(limit: int = 100, db: Neo4jClient = Depends(get_db)) -> ConflictCasesResponse:
+@app.get("/conflicts/cases", response_model=ConflictCaseListResponse)
+def list_conflict_cases(limit: int = 100, db: Neo4jClient = Depends(get_db)) -> ConflictCaseListResponse:
     store = ConflictStore(db)
-    return ConflictCasesResponse(cases=store.list_conflict_cases(limit=limit))
+    return ConflictCaseListResponse(cases=store.list_conflict_cases(limit=limit))
 
 
 @app.post("/inference/run", response_model=InferenceResponse)
@@ -230,7 +230,12 @@ def run_inference(
             inferred_rel: {item for item in conflict_list}
             for inferred_rel, conflict_list in payload.conflict_pairs.items()
         }
-    engine = InferenceEngine(repo, store, conflict_pairs=conflict_pairs)
+    engine = InferenceEngine(
+        repo,
+        store,
+        conflict_store=conflict_store,
+        conflict_pairs=conflict_pairs,
+    )
 
     if payload.fixpoint:
         summary = engine.run_fixpoint(

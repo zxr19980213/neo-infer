@@ -74,8 +74,7 @@ class ConflictStore:
         )
 
     def record_conflict_cases(self, rule: Rule, negative_relation: str, iteration: int) -> int:
-        if len(rule.body_relations) != 2:
-            # 先支持长度2，长度3冲突记录后续扩展。
+        if len(rule.body_relations) < 2:
             return 0
 
         body_1 = rule.body_relations[0].replace("`", "")
@@ -99,7 +98,10 @@ class ConflictStore:
                       cc.first_iteration = $iteration,
                       cc.last_iteration = $iteration
         SET cc.updated_at = datetime(),
-            cc.detect_count = coalesce(cc.detect_count, 0) + 1,
+            cc.detect_count = CASE
+              WHEN cc.last_iteration = $iteration THEN coalesce(cc.detect_count, 0)
+              ELSE coalesce(cc.detect_count, 0) + 1
+            END,
             cc.last_iteration = $iteration
         RETURN count(cc) AS cnt
         """
@@ -136,8 +138,8 @@ class ConflictStore:
                 rule_id=str(row["rule_id"]),
                 inferred_relation=str(row["inferred_relation"]),
                 conflicting_relation=str(row["conflicting_relation"]),
-                source_x=str(row["source_x"]),
-                source_y=str(row["source_y"]),
+                source_id=str(row["source_x"]),
+                target_id=str(row["source_y"]),
                 detect_count=int(row["detect_count"]),
                 first_iteration=int(row["first_iteration"]),
                 last_iteration=int(row["last_iteration"]),
