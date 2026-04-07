@@ -5,14 +5,14 @@ from fastapi import Depends, FastAPI, HTTPException
 from neo_infer.config import Settings, get_settings, parse_conflict_relation_pairs
 from neo_infer.conflict_management import ConflictStore
 from neo_infer.db import Neo4jClient
-from neo_infer.incremental_mining import IncrementalMiner
+from neo_infer.incremental_mining import IncrementalMiningService
 from neo_infer.incremental_store import IncrementalStore
 from neo_infer.inference import InferenceEngine
 from neo_infer.models import (
-    EdgeDelta,
-    EdgeDeltaApplyRequest,
-    EdgeDeltaApplyResponse,
-    EdgeDeltaBatch,
+    ChangeLogAppendRequest,
+    ChangeLogPendingResponse,
+    IncrementalConsumeRequest,
+    IncrementalConsumeResponse,
     ConflictCaseListResponse,
     IncrementalMineRequest,
     ConflictPairsResponse,
@@ -67,59 +67,19 @@ def mine_rules(
     return MineRulesResponse(rules=discovered)
 
 
-@app.post("/graph/edges/delta", response_model=EdgeDeltaApplyResponse)
-def apply_edge_deltas(
-    payload: EdgeDeltaApplyRequest,
+@app.post("/changes/append", response_model=ChangeLogPendingResponse)
+def append_changes(
+    payload: ChangeLogAppendRequest,
     settings: Settings = Depends(get_settings),
     db: Neo4jClient = Depends(get_db),
-) -> EdgeDeltaApplyResponse:
+) -> ChangeLogPendingResponse:
+    _ = settings
     store = IncrementalStore(db)
-    batch = EdgeDeltaBatch(
-        added_edges=[EdgeDelta(**item.model_dump()) for item in payload.added_edges],
-        removed_edges=[EdgeDelta(**item.model_dump()) for item in payload.removed_edges],
-        cursor=payload.cursor,
-    )
-    batch_id, added_count, removed_count = store.append_changelog(batch)
-
-    # 同步写图：新增用 MERGE，删除用 MATCH DELETE。该接口可作为增量入口。
-    if payload.added_edges:
-        db.run_write(
-            """
-            UNWIND $edges AS edge
-            MATCH (s) WHERE elementId(s) = edge.src_id
-            MATCH (t) WHERE elementId(t) = edge.dst_id
-            CALL {
-              WITH s, t, edge
-              WITH s, t, edge, replace(edge.rel, "`", "") AS rel
-              CALL apoc.create.relationship(s, rel, {}, t) YIELD rel AS created_rel
-              RETURN created_rel
-            }
-            RETURN count(*) AS updated
-            """,
-            {
-                "edges": [
-                    {"src_id": e.src_id, "dst_id": e.dst_id, "rel": e.rel}
-                    for e in payload.added_edges
-                ]
-            },
-        )
-    if payload.removed_edges:
-        # 不使用动态关系删除，退化为按两端节点和关系类型匹配。
-        for edge in payload.removed_edges:
-            rel = edge.rel.replace("`", "")
-            db.run_write(
-                f"""
-                MATCH (s)-[r:`{rel}`]->(t)
-                WHERE elementId(s) = $src_id AND elementId(t) = $dst_id
-                DELETE r
-                """,
-                {"src_id": edge.src_id, "dst_id": edge.dst_id},
-            )
-
-    return EdgeDeltaApplyResponse(
-        batch_id=batch_id,
-        added_count=added_count,
-        removed_count=removed_count,
+    store.append_changes(payload.added_edges, payload.removed_edges)
+    pending = store.pending_changes(limit=1000)
+    return ChangeLogPendingResponse(
+        pending_count=len(pending),
+        entries=pending,
     )
 
 
@@ -155,17 +115,22 @@ def mine_rules_incremental_length2(
 ) -> MineRulesResponse:
     repo = QueryRepository(db.driver, database=settings.neo4j_database)
     store = RuleStore(db)
+    base_miner = RuleMiningService(repo)
     inc_store = IncrementalStore(db)
-    miner = IncrementalMiner(repo=repo, rule_store=store, inc_store=inc_store)
-    discovered = miner.run_incremental_length2(
-        min_support=payload.min_support if payload.min_support is not None else settings.min_support,
-        min_pca_confidence=(
-            payload.min_pca_confidence if payload.min_pca_confidence is not None else settings.min_confidence
+    inc_miner = IncrementalMiningService(base_miner, store, inc_store)
+    result = inc_miner.run_incremental(
+        request=MineRulesRequest(
+            limit=payload.limit,
+            min_support=payload.min_support,
+            min_pca_confidence=payload.min_pca_confidence,
+            min_head_coverage=payload.min_head_coverage,
+            candidate_limit=payload.candidate_limit,
+            body_length=2,
+            changed_relations=payload.affected_relations,
         ),
-        min_head_coverage=payload.min_head_coverage or 0.0,
-        top_k=payload.limit,
+        body_length=2,
     )
-    return MineRulesResponse(rules=discovered)
+    return MineRulesResponse(rules=result.rules)
 
 
 @app.post("/rules/mine/incremental/length3", response_model=MineRulesResponse)
@@ -176,18 +141,55 @@ def mine_rules_incremental_length3(
 ) -> MineRulesResponse:
     repo = QueryRepository(db.driver, database=settings.neo4j_database)
     store = RuleStore(db)
+    base_miner = RuleMiningService(repo)
     inc_store = IncrementalStore(db)
-    miner = IncrementalMiner(repo=repo, rule_store=store, inc_store=inc_store)
-    discovered = miner.run_incremental_length3(
+    inc_miner = IncrementalMiningService(base_miner, store, inc_store)
+    result = inc_miner.run_incremental(
+        request=MineRulesRequest(
+            limit=payload.limit,
+            min_support=payload.min_support,
+            min_pca_confidence=payload.min_pca_confidence,
+            min_head_coverage=payload.min_head_coverage,
+            candidate_limit=payload.candidate_limit,
+            body_length=3,
+            changed_relations=payload.affected_relations,
+        ),
+        body_length=3,
+    )
+    return MineRulesResponse(rules=result.rules)
+
+
+@app.post("/rules/mine/incremental/from-changelog", response_model=IncrementalConsumeResponse)
+def mine_rules_incremental_from_changelog(
+    payload: IncrementalConsumeRequest,
+    settings: Settings = Depends(get_settings),
+    db: Neo4jClient = Depends(get_db),
+) -> IncrementalConsumeResponse:
+    repo = QueryRepository(db.driver, database=settings.neo4j_database)
+    store = RuleStore(db)
+    base_miner = RuleMiningService(repo)
+    inc_store = IncrementalStore(db)
+    inc_miner = IncrementalMiningService(base_miner, store, inc_store)
+
+    request = MineRulesRequest(
+        limit=payload.limit,
         min_support=payload.min_support if payload.min_support is not None else settings.min_support,
         min_pca_confidence=(
-            payload.min_pca_confidence if payload.min_pca_confidence is not None else settings.min_confidence
+            payload.min_pca_confidence
+            if payload.min_pca_confidence is not None
+            else settings.min_confidence
         ),
         min_head_coverage=payload.min_head_coverage or 0.0,
-        top_k=payload.limit,
-        fanout_cap=payload.fanout_cap or 1000,
+        candidate_limit=payload.candidate_limit,
+        body_length=payload.body_length,
+        changed_relations=payload.changed_relations,
     )
-    return MineRulesResponse(rules=discovered)
+    result = inc_miner.run_incremental(request=request, body_length=payload.body_length, change_limit=payload.change_limit)
+    return IncrementalConsumeResponse(
+        processed_changes=result.processed_events,
+        affected_relations=result.affected_relations,
+        rules=result.rules,
+    )
 
 
 @app.get("/rules", response_model=RuleSetResponse)

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from neo_infer.db import Neo4jClient
-from neo_infer.models import ChangeEdge, DeltaBatch, Rule
+from neo_infer.models import ChangeEdge, DeltaBatch, EdgeDeltaBatch, Rule
 
 
 @dataclass(frozen=True)
@@ -59,6 +59,13 @@ class IncrementalStore:
             """,
             {"events": payload},
         )
+
+    def append_changelog(self, batch: EdgeDeltaBatch) -> tuple[int, int, int]:
+        self.append_changes(batch.added_edges, batch.removed_edges)
+        added_count = len(batch.added_edges)
+        removed_count = len(batch.removed_edges)
+        cursor = self.get_cursor()
+        return cursor, added_count, removed_count
 
     def get_cursor(self) -> int:
         rows = self._client.run_read(
@@ -117,6 +124,13 @@ class IncrementalStore:
                 added.append(edge)
             max_id = max(max_id, int(row["change_id"]))
         return DeltaBatch(added_edges=added, removed_edges=removed, cursor=max_id)
+
+    def consume_changes(self, limit: int = 2000) -> tuple[list[ChangeEdge], int]:
+        delta = self.consume_delta(limit=limit)
+        events: list[ChangeEdge] = []
+        events.extend(delta.added_edges)
+        events.extend(delta.removed_edges)
+        return events, delta.cursor
 
     def upsert_rule_stats(self, rule: Rule, support: int, pca_denominator: int, head_count: int) -> None:
         self._client.run_write(
@@ -178,6 +192,10 @@ class IncrementalStore:
             {"items": rows},
         )
 
+    def update_rule_indexes(self, rules: Iterable[Rule]) -> None:
+        for rule in rules:
+            self.set_rule_relations(rule)
+
     def affected_rule_ids(self, relations: set[str], limit: int = 5000) -> list[str]:
         if not relations:
             return []
@@ -191,4 +209,18 @@ class IncrementalStore:
             {"rels": sorted(relations), "limit": int(limit)},
         )
         return [str(row["rule_id"]) for row in rows]
+
+    def update_rule_stats(self, rules: Iterable[Rule]) -> None:
+        for rule in rules:
+            pca_denominator = int(round(rule.support / rule.pca_confidence)) if rule.pca_confidence > 0 else 0
+            head_count = int(round(rule.support / rule.head_coverage)) if rule.head_coverage > 0 else 0
+            self.upsert_rule_stats(
+                rule=rule,
+                support=rule.support,
+                pca_denominator=pca_denominator,
+                head_count=head_count,
+            )
+
+    def mark_consumed(self, cursor: int) -> None:
+        self.set_cursor(cursor)
 

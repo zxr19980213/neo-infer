@@ -99,7 +99,47 @@ class ConflictPairsUpdateRequest(BaseModel):
 
 
 class IncrementalMineRequest(MineRulesRequest):
-    affected_relations: list[str] = Field(min_length=1)
+    affected_relations: list[str] = Field(default_factory=list)
+    change_limit: int = Field(default=2000, ge=1, le=50000)
+    fanout_cap: int = Field(default=1000, ge=10, le=20000)
+
+
+class EdgeDelta(BaseModel):
+    src_id: str
+    rel: str
+    dst_id: str
+    created_at: str | None = None
+
+
+class EdgeDeltaBatch(BaseModel):
+    added_edges: list[EdgeDelta] = Field(default_factory=list)
+    removed_edges: list[EdgeDelta] = Field(default_factory=list)
+    cursor: int | None = None
+
+
+class EdgeDeltaApplyRequest(BaseModel):
+    added_edges: list[EdgeDelta] = Field(default_factory=list)
+    removed_edges: list[EdgeDelta] = Field(default_factory=list)
+    cursor: int | None = None
+
+
+class EdgeDeltaApplyResponse(BaseModel):
+    batch_id: str
+    added_count: int = Field(ge=0)
+    removed_count: int = Field(ge=0)
+
+
+class ChangeEdge(BaseModel):
+    src: str
+    rel: str
+    dst: str
+    created_at: str | None = None
+
+
+class DeltaBatch(BaseModel):
+    added_edges: list[ChangeEdge]
+    removed_edges: list[ChangeEdge]
+    cursor: int
 
 
 class EdgeItem(BaseModel):
