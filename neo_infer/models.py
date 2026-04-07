@@ -62,10 +62,12 @@ class InferenceRequest(BaseModel):
     limit_rules: int = Field(default=100, ge=1, le=10000)
     fixpoint: bool = False
     max_iterations: int = Field(default=5, ge=1, le=100)
+    check_conflicts: bool = True
 
 
 class InferenceResponse(BaseModel):
     results: list[ApplyRuleResult]
     total_created: int = Field(ge=0)
+    total_conflicts: int = Field(default=0, ge=0)
     iterations_run: int = Field(ge=0)
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import Depends, FastAPI
 
-from neo_infer.config import Settings, get_settings
+from neo_infer.config import Settings, get_settings, parse_conflict_relation_pairs
 from neo_infer.db import Neo4jClient
 from neo_infer.inference import InferenceEngine
 from neo_infer.models import (
@@ -88,17 +88,28 @@ def run_inference(
 ) -> InferenceResponse:
     repo = QueryRepository(db.driver, database=settings.neo4j_database)
     store = RuleStore(db)
-    engine = InferenceEngine(repo, store, conflict_relation=settings.conflict_relation)
+    conflict_pairs = parse_conflict_relation_pairs(settings.conflict_relation_pairs)
+    engine = InferenceEngine(repo, store, conflict_pairs=conflict_pairs)
 
     if payload.fixpoint:
-        results = engine.run_fixpoint(max_iterations=payload.max_iterations, limit_rules=payload.limit_rules)
+        summary = engine.run_fixpoint(
+            max_iterations=payload.max_iterations,
+            limit_rules=payload.limit_rules,
+            check_conflicts=payload.check_conflicts,
+        )
+        results = summary.results
         iterations_run = max((r.iteration for r in results), default=0)
     else:
-        results = engine.run_once(limit_rules=payload.limit_rules)
+        summary = engine.run_once(
+            limit_rules=payload.limit_rules,
+            check_conflicts=payload.check_conflicts,
+        )
+        results = summary.results
         iterations_run = 1 if results else 0
 
     return InferenceResponse(
         results=results,
         total_created=sum(item.created_triples for item in results),
         iterations_run=iterations_run,
+        total_conflicts=summary.conflicts_detected,
     )
