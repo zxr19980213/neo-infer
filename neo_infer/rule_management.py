@@ -27,7 +27,7 @@ class RuleStore:
         ]
         if not payload:
             return
-        self._client.run_query(
+        self._client.run_write(
             """
             UNWIND $rules AS rule
             MERGE (r:Rule {rule_id: rule.rule_id})
@@ -43,8 +43,8 @@ class RuleStore:
             {"rules": payload},
         )
 
-    def list_rules(self, status: str | None = None, limit: int = 100) -> list[RuleRecord]:
-        rows = self._client.run_query(
+    def list_rules(self, status: str | None = None, limit: int = 100) -> list[Rule]:
+        rows = self._client.run_read(
             """
             MATCH (r:Rule)
             WHERE $status IS NULL OR r.status = $status
@@ -78,7 +78,7 @@ class RuleStore:
         return result
 
     def update_rule_status(self, rule_id: str, status: str) -> bool:
-        rows = self._client.run_query(
+        rows = self._client.run_write(
             """
             MATCH (r:Rule {rule_id: $rule_id})
             SET r.status = $status
