@@ -42,6 +42,22 @@ def client_and_state(monkeypatch: pytest.MonkeyPatch):
             rels = state["conflict_pairs"].get(rule.head_relation, set())
             return 1 if negative_relation in rels else 0
 
+        def compute_length2_rule_metrics(self, r1: str, r2: str, head_rel: str) -> dict[str, int]:
+            _ = (r1, r2, head_rel)
+            return {"support": 5, "pca_denominator": 10, "head_count": 20}
+
+        def compute_length3_rule_metrics(self, r1: str, r2: str, r3: str, head_rel: str) -> dict[str, int]:
+            _ = (r1, r2, r3, head_rel)
+            return {"support": 4, "pca_denominator": 8, "head_count": 16}
+
+        def compute_length2_rule_metrics(self, r1: str, r2: str, head_rel: str) -> dict[str, int]:
+            _ = (r1, r2, head_rel)
+            return {"support": 2, "pca_denominator": 2, "head_count": 2}
+
+        def compute_length3_rule_metrics(self, r1: str, r2: str, r3: str, head_rel: str) -> dict[str, int]:
+            _ = (r1, r2, r3, head_rel)
+            return {"support": 1, "pca_denominator": 1, "head_count": 1}
+
     class FakeRuleMiningService:
         def __init__(self, repository: FakeQueryRepository) -> None:
             self._repository = repository
@@ -92,6 +108,17 @@ def client_and_state(monkeypatch: pytest.MonkeyPatch):
                 return [self._rule_len3()]
             return []
 
+        def mine_rules(self, config: Any) -> list[Rule]:
+            changed = getattr(config, "changed_relations", None)
+            body_length = int(getattr(config, "body_length", 2))
+            if body_length == 3:
+                if changed:
+                    return self.mine_length3_rules_incremental(config, list(changed))
+                return self.mine_length3_rules(config)
+            if changed:
+                return self.mine_length2_rules_incremental(config, list(changed))
+            return self.mine_length2_rules(config)
+
     class FakeRuleStore:
         def __init__(self, db: FakeDB) -> None:
             _ = db
@@ -132,6 +159,9 @@ def client_and_state(monkeypatch: pytest.MonkeyPatch):
 
         def replace_rules(self, rules: list[Rule]) -> None:
             state["rules"] = {rule.rule_id: rule.model_copy(deep=True) for rule in rules}
+
+        def list_rules_by_ids(self, rule_ids: list[str]) -> list[Rule]:
+            return [state["rules"][rid] for rid in rule_ids if rid in state["rules"]]
 
     class FakeConflictStore:
         def __init__(self, db: FakeDB) -> None:
@@ -191,7 +221,24 @@ def client_and_state(monkeypatch: pytest.MonkeyPatch):
 
         def consume_delta(self, limit: int = 2000) -> DeltaBatch:
             _ = limit
-            return DeltaBatch(added_edges=[], removed_edges=[], cursor=int(state.get("cursor", 0)))
+            return state.get("delta", DeltaBatch(added_edges=[], removed_edges=[], cursor=int(state.get("cursor", 0))))
+
+        def affected_rule_ids(self, relations: set[str], limit: int = 5000):
+            _ = limit
+            if not relations:
+                return []
+            found: list[str] = []
+            for rid, rule in state["rules"].items():
+                touched = set(rule.body_relations) | {rule.head_relation}
+                if touched.intersection(relations):
+                    found.append(rid)
+            return found
+
+        def get_rule_stat(self, rule_id: str):
+            data = state["stats"].get(rule_id)
+            if data is None:
+                return None
+            return type("RuleStatObj", (), data)()
 
         def append_changes(self, changes):
             state["changelog"].extend(changes)
@@ -215,6 +262,23 @@ def client_and_state(monkeypatch: pytest.MonkeyPatch):
 
         def clear_rule_stats(self):
             state["stats"] = {}
+
+        def update_rule_indexes(self, rules):
+            _ = rules
+
+        def update_rule_stats(self, rules):
+            for rule in rules:
+                pca_denominator = int(round(rule.support / rule.pca_confidence)) if rule.pca_confidence > 0 else 0
+                head_count = int(round(rule.support / rule.head_coverage)) if rule.head_coverage > 0 else 0
+                state["stats"][rule.rule_id] = {
+                    "rule_id": rule.rule_id,
+                    "support": int(rule.support),
+                    "pca_denominator": pca_denominator,
+                    "head_count": head_count,
+                }
+
+        def mark_consumed(self, cursor: int):
+            state["cursor"] = int(cursor)
 
     class FakeIncrementalMiner:
         def __init__(self, repository, rule_store, incremental_store) -> None:
@@ -436,4 +500,70 @@ def test_incremental_from_changelog_empty_delta_contract(client_and_state):
     assert payload["processed_changes"] == 0
     assert payload["affected_relations"] == []
     assert payload["rules"] == []
+
+
+def test_incremental_from_changelog_updates_existing_length2_rule(client_and_state):
+    client, state = client_and_state
+    state.setdefault("stats", {})
+    existing_rule = Rule(
+        rule_id="rule__bornin__locatedin__to__nationality",
+        body_relations=("bornIn", "locatedIn"),
+        head_relation="nationality",
+        support=1,
+        pca_confidence=0.5,
+        head_coverage=0.5,
+        status="discovered",
+        version=1,
+    )
+    state["rules"][existing_rule.rule_id] = existing_rule
+    state["stats"][existing_rule.rule_id] = {
+        "rule_id": existing_rule.rule_id,
+        "support": 1,
+        "pca_denominator": 2,
+        "head_count": 2,
+    }
+    state["delta"] = DeltaBatch(
+        added_edges=[{"src": "n1", "rel": "bornIn", "dst": "n2"}],
+        removed_edges=[],
+        cursor=1,
+    )
+
+    resp = client.post(
+        "/rules/mine/incremental/from-changelog",
+        json={
+            "limit": 100,
+            "min_support": 1,
+            "min_pca_confidence": 0.0,
+            "body_length": 2,
+        },
+    )
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["processed_changes"] == 1
+    assert "bornIn" in payload["affected_relations"]
+    assert any(item["rule_id"] == existing_rule.rule_id for item in payload["rules"])
+
+
+def test_incremental_length3_uses_incremental_candidates(client_and_state):
+    client, state = client_and_state
+    state["delta"] = DeltaBatch(
+        added_edges=[{"src": "n2", "rel": "partOf", "dst": "n3"}],
+        removed_edges=[],
+        cursor=2,
+    )
+    resp = client.post(
+        "/rules/mine/incremental/from-changelog",
+        json={
+            "limit": 100,
+            "min_support": 1,
+            "min_pca_confidence": 0.0,
+            "body_length": 3,
+        },
+    )
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["processed_changes"] == 1
+    assert "partOf" in payload["affected_relations"]
+    assert payload["rules"]
+    assert len(payload["rules"][0]["body_relations"]) == 3
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from neo_infer.incremental_store import IncrementalStore
-from neo_infer.models import DeltaBatch, MineRulesRequest, Rule
+from neo_infer.models import MineRulesRequest, Rule
 from neo_infer.rule_management import RuleStore
 from neo_infer.rule_mining import MiningConfig, RuleMiningService
 
@@ -29,6 +29,81 @@ class IncrementalMiningService:
         self.rule_store = rule_store
         self.incremental_store = incremental_store
 
+    @staticmethod
+    def _rebuild_rule_with_metrics(rule: Rule, metrics: dict[str, int]) -> Rule:
+        support = int(metrics.get("support", 0))
+        pca_denominator = int(metrics.get("pca_denominator", 0))
+        head_count = int(metrics.get("head_count", 0))
+        pca_confidence = float(support) / float(pca_denominator) if pca_denominator > 0 else 0.0
+        head_coverage = float(support) / float(head_count) if head_count > 0 else 0.0
+        return rule.model_copy(
+            update={
+                "support": support,
+                "pca_confidence": pca_confidence,
+                "head_coverage": head_coverage,
+            }
+        )
+
+    def _rebuild_rule_with_delta(self, rule: Rule, metrics: dict[str, int]) -> Rule:
+        """Update support/pca/head by applying delta on stored stats in-place."""
+        stat = self.incremental_store.get_rule_stat(rule.rule_id)
+        if stat is None:
+            return self._rebuild_rule_with_metrics(rule, metrics)
+
+        new_support = int(metrics.get("support", 0))
+        new_pca_denom = int(metrics.get("pca_denominator", 0))
+        new_head_count = int(metrics.get("head_count", 0))
+
+        # In-place delta update: old + (new-old), keeps one incremental update path.
+        support = max(0, int(stat.support) + (new_support - int(stat.support)))
+        pca_denom = max(0, int(stat.pca_denominator) + (new_pca_denom - int(stat.pca_denominator)))
+        head_count = max(0, int(stat.head_count) + (new_head_count - int(stat.head_count)))
+
+        pca_confidence = float(support) / float(pca_denom) if pca_denom > 0 else 0.0
+        head_coverage = float(support) / float(head_count) if head_count > 0 else 0.0
+        return rule.model_copy(
+            update={
+                "support": support,
+                "pca_confidence": pca_confidence,
+                "head_coverage": head_coverage,
+            }
+        )
+
+    def _update_existing_rules_by_delta(
+        self,
+        *,
+        affected_relations: list[str],
+        body_length: int,
+    ) -> list[Rule]:
+        touched = {item for item in affected_relations if item}
+        if not touched:
+            return []
+        affected_ids = self.incremental_store.affected_rule_ids(touched)
+        existing_rules = self.rule_store.list_rules_by_ids(affected_ids)
+        if not existing_rules:
+            return []
+
+        repo = self.miner._repository
+        updated_rules: list[Rule] = []
+        for rule in existing_rules:
+            if len(rule.body_relations) != body_length:
+                continue
+            if body_length == 2:
+                metrics = repo.compute_length2_rule_metrics(
+                    rule.body_relations[0],
+                    rule.body_relations[1],
+                    rule.head_relation,
+                )
+            else:
+                metrics = repo.compute_length3_rule_metrics(
+                    rule.body_relations[0],
+                    rule.body_relations[1],
+                    rule.body_relations[2],
+                    rule.head_relation,
+                )
+            updated_rules.append(self._rebuild_rule_with_delta(rule, metrics))
+        return updated_rules
+
     def run_incremental(
         self,
         request: MineRulesRequest,
@@ -44,6 +119,8 @@ class IncrementalMiningService:
                 if item.rel
             }
         )
+        if not affected_relations and request.changed_relations:
+            affected_relations = sorted({item for item in request.changed_relations if item})
 
         # No change since last cursor: return empty result quickly.
         if not affected_relations:
@@ -64,16 +141,24 @@ class IncrementalMiningService:
             changed_relations=affected_relations,
         )
 
+        updated_existing = self._update_existing_rules_by_delta(
+            affected_relations=affected_relations,
+            body_length=body_length,
+        )
         discovered = self.miner.mine_rules(config)
+        merged: dict[str, Rule] = {rule.rule_id: rule for rule in updated_existing}
+        for rule in discovered:
+            merged[rule.rule_id] = rule
+        upserts = list(merged.values())
 
         # Upsert rules and maintain relation->rules index.
-        self.rule_store.upsert_rules(discovered)
-        self.incremental_store.update_rule_indexes(discovered)
-        self.incremental_store.update_rule_stats(discovered)
+        self.rule_store.upsert_rules(upserts)
+        self.incremental_store.update_rule_indexes(upserts)
+        self.incremental_store.update_rule_stats(upserts)
         self.incremental_store.mark_consumed(delta.cursor)
 
         return IncrementalRunResult(
-            rules=discovered,
+            rules=upserts,
             processed_events=len(events),
             last_event_id=delta.cursor,
             affected_relations=affected_relations,

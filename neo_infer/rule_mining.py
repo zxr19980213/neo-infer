@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from neo_infer.models import Rule, build_rule_id, normalize_relation_token
 from neo_infer.query import QueryRepository
@@ -139,14 +139,12 @@ class RuleMiningService:
         normalized = [item for item in normalized if item]
         if not normalized:
             return []
-
-        base_rules = self.mine_length3_rules(replace(config, changed_relations=None))
-        filtered: list[Rule] = []
-        touched = set(normalized)
-        for rule in base_rules:
-            if rule.head_relation in touched or any(rel in touched for rel in rule.body_relations):
-                filtered.append(rule)
-        return filtered[: config.top_k]
+        raw_candidates = self._repository.length3_path_rule_candidates_incremental(
+            limit=config.candidate_limit,
+            affected_relations=normalized,
+        )
+        head_counts = self._repository.head_relation_counts()
+        return self._to_rules_from_candidates(raw_candidates, head_counts, config)
 
     def mine_length3_rules(self, config: MiningConfig) -> list[Rule]:
         raw_candidates = self._repository.length3_path_rule_candidates(limit=config.candidate_limit)

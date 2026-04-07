@@ -118,3 +118,37 @@ class RuleStore:
         )
         return [str(row["rule_id"]) for row in rows]
 
+    def list_rules_by_ids(self, rule_ids: list[str]) -> list[Rule]:
+        if not rule_ids:
+            return []
+        rows = self._client.run_read(
+            """
+            UNWIND $rule_ids AS rid
+            MATCH (r:Rule {rule_id: rid})
+            RETURN r.rule_id AS rule_id,
+                   r.body_relations AS body_relations,
+                   r.head_relation AS head_relation,
+                   r.support AS support,
+                   r.pca_confidence AS pca_confidence,
+                   r.head_coverage AS head_coverage,
+                   r.status AS status,
+                   r.version AS version
+            """,
+            {"rule_ids": rule_ids},
+        )
+        result: list[Rule] = []
+        for row in rows:
+            result.append(
+                Rule(
+                    rule_id=row["rule_id"],
+                    body_relations=tuple(row["body_relations"]),
+                    head_relation=row["head_relation"],
+                    support=int(row["support"]),
+                    pca_confidence=float(row["pca_confidence"]),
+                    head_coverage=float(row["head_coverage"]),
+                    status=row.get("status", "discovered"),
+                    version=int(row.get("version", 1)),
+                )
+            )
+        return result
+

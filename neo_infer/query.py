@@ -209,6 +209,127 @@ class QueryRepository:
                 )
             return candidates
 
+    def length3_path_rule_candidates_incremental(
+        self,
+        limit: int,
+        affected_relations: list[str],
+    ) -> list[PathRuleCandidate]:
+        touched = [rel.strip().replace("`", "") for rel in affected_relations if rel.strip()]
+        if not touched:
+            return []
+
+        phase1_query = """
+        MATCH (x)-[a]->(m1)-[b]->(m2)-[c]->(y)
+        WITH type(a) AS r1, type(b) AS r2, type(c) AS r3, x, y
+        MATCH (x)-[h]->(y)
+        WITH r1, r2, r3, type(h) AS head, collect(DISTINCT [x, y]) AS pairs
+        WHERE r1 IN $rels OR r2 IN $rels OR r3 IN $rels OR head IN $rels
+        RETURN r1, r2, r3, head, size(pairs) AS support
+        ORDER BY support DESC
+        LIMIT $limit
+        """
+        with self._driver.session(database=self._database) as session:
+            phase1_records = list(session.run(phase1_query, {"limit": limit, "rels": touched}))
+            candidates: list[PathRuleCandidate] = []
+            denominator_cache: dict[tuple[str, str, str, str], int] = {}
+
+            for record in phase1_records:
+                r1 = str(record["r1"])
+                r2 = str(record["r2"])
+                r3 = str(record["r3"])
+                head = str(record["head"])
+                support = int(record["support"])
+                key = (r1, r2, r3, head)
+                if key not in denominator_cache:
+                    pca_query = """
+                    MATCH (x)-[a]->(m1)-[b]->(m2)-[c]->(y)
+                    WHERE type(a) = $r1 AND type(b) = $r2 AND type(c) = $r3
+                      AND EXISTS { MATCH (x)-[hh]->() WHERE type(hh) = $head_rel }
+                    RETURN count(DISTINCT [x, y]) AS pca_denominator
+                    """
+                    pca_record = session.run(
+                        pca_query,
+                        {"r1": r1, "r2": r2, "r3": r3, "head_rel": head},
+                    ).single()
+                    denominator_cache[key] = int(pca_record["pca_denominator"]) if pca_record else 0
+
+                candidates.append(
+                    PathRuleCandidate(
+                        body_relations=(r1, r2, r3),
+                        head_relation=head,
+                        support=support,
+                        pca_denominator=denominator_cache[key],
+                    )
+                )
+            return candidates
+
+    def compute_length2_rule_metrics(self, r1: str, r2: str, head_rel: str) -> dict[str, int]:
+        query = """
+        CALL {
+          MATCH (x)-[a]->(z)-[b]->(y)
+          WHERE type(a) = $r1 AND type(b) = $r2
+          MATCH (x)-[h]->(y)
+          WHERE type(h) = $head_rel
+          RETURN count(DISTINCT [x, y]) AS support
+        }
+        CALL {
+          MATCH (x)-[a]->(z)-[b]->(y)
+          WHERE type(a) = $r1 AND type(b) = $r2
+            AND EXISTS { MATCH (x)-[hh]->() WHERE type(hh) = $head_rel }
+          RETURN count(DISTINCT [x, y]) AS pca_denominator
+        }
+        CALL {
+          MATCH ()-[h]->()
+          WHERE type(h) = $head_rel
+          RETURN count(h) AS head_count
+        }
+        RETURN support, pca_denominator, head_count
+        """
+        with self._driver.session(database=self._database) as session:
+            row = session.run(query, {"r1": r1, "r2": r2, "head_rel": head_rel}).single()
+            if row is None:
+                return {"support": 0, "pca_denominator": 0, "head_count": 0}
+            return {
+                "support": int(row["support"]),
+                "pca_denominator": int(row["pca_denominator"]),
+                "head_count": int(row["head_count"]),
+            }
+
+    def compute_length3_rule_metrics(self, r1: str, r2: str, r3: str, head_rel: str) -> dict[str, int]:
+        query = """
+        CALL {
+          MATCH (x)-[a]->(m1)-[b]->(m2)-[c]->(y)
+          WHERE type(a) = $r1 AND type(b) = $r2 AND type(c) = $r3
+          MATCH (x)-[h]->(y)
+          WHERE type(h) = $head_rel
+          RETURN count(DISTINCT [x, y]) AS support
+        }
+        CALL {
+          MATCH (x)-[a]->(m1)-[b]->(m2)-[c]->(y)
+          WHERE type(a) = $r1 AND type(b) = $r2 AND type(c) = $r3
+            AND EXISTS { MATCH (x)-[hh]->() WHERE type(hh) = $head_rel }
+          RETURN count(DISTINCT [x, y]) AS pca_denominator
+        }
+        CALL {
+          MATCH ()-[h]->()
+          WHERE type(h) = $head_rel
+          RETURN count(h) AS head_count
+        }
+        RETURN support, pca_denominator, head_count
+        """
+        with self._driver.session(database=self._database) as session:
+            row = session.run(
+                query,
+                {"r1": r1, "r2": r2, "r3": r3, "head_rel": head_rel},
+            ).single()
+            if row is None:
+                return {"support": 0, "pca_denominator": 0, "head_count": 0}
+            return {
+                "support": int(row["support"]),
+                "pca_denominator": int(row["pca_denominator"]),
+                "head_count": int(row["head_count"]),
+            }
+
     def apply_length2_rule(self, rule: Rule) -> int:
         body_r1 = rule.body_relations[0].replace("`", "")
         body_r2 = rule.body_relations[1].replace("`", "")
