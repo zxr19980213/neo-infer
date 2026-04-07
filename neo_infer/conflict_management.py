@@ -26,8 +26,8 @@ class ConflictStore:
         self._client.run_write(
             """
             MERGE (c:ConflictRule {head_relation: $head_relation, conflict_relation: $conflict_relation})
-            SET c.updated_at = datetime()
             ON CREATE SET c.created_at = datetime()
+            SET c.updated_at = datetime()
             """,
             {"head_relation": head_relation, "conflict_relation": conflict_relation},
         )
@@ -66,8 +66,8 @@ class ConflictStore:
             """
             UNWIND $pairs AS item
             MERGE (c:ConflictRule {head_relation: item.head_relation, conflict_relation: item.conflict_relation})
-            SET c.updated_at = datetime()
             ON CREATE SET c.created_at = datetime()
+            SET c.updated_at = datetime()
             """,
             {"pairs": payload},
         )
