@@ -3,7 +3,7 @@ name = "neo-infer"
 version = "0.1.0"
 description = "Knowledge graph ILP rule mining and inference service."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.115.0",
     "neo4j>=5.27.0",
