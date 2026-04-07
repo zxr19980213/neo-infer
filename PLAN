@@ -1,0 +1,168 @@
+# 知识图谱归纳逻辑编程（ILP）实施计划
+
+## 1. 核心目标
+围绕知识图谱执行两阶段闭环：
+1) **规则挖掘**：从图中学习 Horn 规则，并计算可解释性指标（support、PCA confidence、head coverage）。
+2) **规则应用**：对已采纳规则进行前向链推理，生成新三元组并可追溯来源。
+
+目标规则示例：
+- `bornIn(X,Y) ∧ locatedIn(Y,Z) → nationality(X,Z)`
+- 典型场景映射：`a→b→c` 与 `a→c` 的共现，即长度为 2 的路径规则。
+
+---
+
+## 2. 算法选型
+### 2.1 主方案：AMIE / AMIE+
+选择理由（相对传统 ILP 如 WARMR、ALEPH）：
+- 面向大规模知识图谱，工程成熟度高。
+- 自底向上枚举闭合路径 Horn 规则，适配关系型图模式。
+- 使用 **PCA Confidence** 代替 CWA，更适合不完备图数据。
+- 具备强剪枝能力，支持在可控规则空间内高效搜索。
+
+### 2.2 关键指标
+- **Support**：规则解释的 head 三元组数量。
+- **PCA Confidence**：
+  `support / #(x,y): head(x,y) ∧ ∃y': body(x,y')`
+- **Head Coverage**：规则对 head 关系覆盖程度，用于补充质量判断。
+
+### 2.3 可选增强
+若后续需支持更灵活规则形式（否定、数值约束、更大规模）：
+- 引入 **AnyBURL**（随机游走采样，速度快，工业场景友好）。
+
+---
+
+## 3. 系统架构
+```
+用户交互层
+  └─ 规则浏览 / 采纳 / 拒绝 / 推理结果审核
+       │
+推理引擎服务（Python/Java）
+  ├─ 规则挖掘模块（AMIE+ / AnyBURL）
+  ├─ 规则应用模块（前向链推理）
+  └─ 规则存储与管理（规则库 + 状态 + 版本）
+       │
+Neo4j 图数据库
+  ├─ 原始知识图谱
+  └─ 推理新增边（带来源规则与置信度标记）
+```
+
+---
+
+## 4. 模块拆解与实现路径
+## 模块 1：高效图查询层（Neo4j/Cypher）
+目标：将 AMIE+ 所需统计尽量下推到 Neo4j，避免全图载入内存。
+
+关键查询模板：
+- support 统计
+- PCA 分母统计
+- 候选规则枚举（长度 2~3 的闭合路径）
+
+设计要点：
+- 按关系类型建索引
+- 高频查询结果缓存
+- 使用 APOC 做路径聚合（如可用）
+
+## 模块 2：规则挖掘引擎（Python）
+核心流程：
+1) 初始化：关系频次统计、关系→实体倒排索引。
+2) 候选生成：从长度 1 起，逐步扩展 body atom（dangling/closing）。
+3) 剪枝：
+   - `support < min_support` 丢弃
+   - `PCA confidence < min_confidence` 丢弃
+   - `head coverage < threshold` 丢弃
+   - `rule_length > max_length`（默认 3）停止扩展
+4) 输出：规则集合及指标（support/confidence/head_coverage）。
+
+性能优化：
+- batch Cypher（减少网络往返）
+- Bloom filter 快速 membership 检测
+- 按 head relation 并行挖掘
+- 图更新后的增量重算
+
+## 模块 3：规则管理
+规则元数据字段：
+- `rule_id`
+- 规则体文本表示
+- `support / confidence / head_coverage`
+- `status`: discovered → adopted → applied / rejected
+- `version`（图更新后重算管理）
+
+存储位置：
+- 优先 Neo4j 专用节点；或独立 SQLite（规则量通常较小）。
+
+## 模块 4：前向链推理（规则应用）
+对已采纳规则 `body1 ∧ body2 → head`：
+1) 匹配满足 body 的绑定 `(x, y)`
+2) 检查 `head(x, y)` 是否已存在
+3) 不存在则创建新边，并记录：
+   - `source_rule_id`
+   - `confidence`
+   - `inferred_at`
+   - `is_inferred = true`
+
+链式推理：
+- 新推理边可继续作为输入
+- 使用 fixpoint iteration，直到无新边
+- 设置最大迭代轮次避免死循环
+
+---
+
+## 5. 技术栈建议
+- 图数据库：Neo4j 4.4+
+- 挖掘引擎：Python + neo4j driver（可快速迭代）
+- 并行：multiprocessing / Ray
+- 规则存储：Neo4j 内规则节点 或 SQLite
+- API：FastAPI（暴露挖掘/采纳/推理接口）
+- 前端（可选）：Neo4j Browser 插件或独立 Web UI
+
+---
+
+## 6. 实施路线图
+### Phase 1（MVP）
+- 规则长度 `<=2`
+- 支持路径规则：`r1(X,Z) ∧ r2(Z,Y) → r3(X,Y)`
+- 用 Cypher 计算 support 与 PCA confidence
+- 输出规则排序列表
+
+### Phase 2
+- 实现前向链推理（单轮）
+- 新边写入 Neo4j，并写入来源与标记字段
+
+### Phase 3
+- 扩展到长度 3 规则
+- 引入剪枝优化
+- 支持增量更新
+
+### Phase 4
+- 实现 fixpoint 链式推理
+- 规则状态管理（采纳/拒绝/版本）
+- 冲突检测（推理新边与已有事实矛盾）
+
+### Phase 5（持续）
+- 批量查询优化
+- 引入 AnyBURL 风格随机游走采样（超大图）
+- 规则质量评估（precision/recall）
+
+---
+
+## 7. 关键架构决策：引擎内置 vs 外置
+### 方案 A：Neo4j 内部（Java Procedure）
+- 优点：性能上限高、无网络 I/O。
+- 缺点：开发调试复杂、与数据库版本耦合更强。
+
+### 方案 B：外部服务（Python）
+- 优点：迭代快、实现灵活、验证成本低。
+- 缺点：大图场景受网络 I/O 影响，需要 batch 缓解。
+
+### 结论（当前建议）
+- **Phase 1~3 采用外部 Python 服务**，优先验证算法正确性与流程完整性；
+- 若性能不足，再将核心统计逻辑迁移为 Neo4j Procedure。
+
+---
+
+## 8. 验收标准（MVP 到可用）
+- 能输出可排序规则清单（含 support/PCA confidence/head coverage）
+- 能对“已采纳规则”执行推理并落库新增边
+- 新增边具备完整溯源信息（规则 ID、置信度、时间戳）
+- 支持至少一次链式迭代，且具备最大轮次保护
+- 规则状态流转可审计（discovered/adopted/applied/rejected + version）
