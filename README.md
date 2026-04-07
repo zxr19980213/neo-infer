@@ -42,6 +42,18 @@ pip install -e .
 uvicorn main:app --reload
 ```
 
+## 自动化稳定性测试（Smoke）
+新增了 API 全链路 smoke tests，覆盖：
+- `rules mine`（长度2/长度3/增量）
+- `inference`（单轮/fixpoint）
+- `conflicts`（增删改查 + case 查询）
+
+运行命令：
+```bash
+pip install pytest
+pytest -q
+```
+
 ## API
 - `GET /health`
 - `POST /rules/mine`
