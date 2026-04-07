@@ -207,6 +207,7 @@ def delete_conflict_pair(
 
 
 @app.get("/conflicts/cases", response_model=ConflictCaseListResponse)
+@app.get("/conflict-cases", response_model=ConflictCaseListResponse, include_in_schema=False)
 def list_conflict_cases(limit: int = 100, db: Neo4jClient = Depends(get_db)) -> ConflictCaseListResponse:
     store = ConflictStore(db)
     return ConflictCaseListResponse(cases=store.list_conflict_cases(limit=limit))
