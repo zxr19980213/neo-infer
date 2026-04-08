@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 
 from neo_infer.models import Rule, build_rule_id, normalize_relation_token
@@ -64,17 +65,195 @@ class RuleMiningService:
         rules.sort(key=lambda x: (x.pca_confidence, x.support, x.head_coverage), reverse=True)
         return rules[: config.top_k]
 
+    @staticmethod
+    def _canonical_signature(body_relations: tuple[str, ...], head_relation: str) -> tuple[tuple[str, ...], str]:
+        # AMIE+ style canonicalization (lightweight): remove spacing/quotes and lower-case.
+        body = tuple(rel.strip().replace("`", "").lower() for rel in body_relations)
+        head = head_relation.strip().replace("`", "").lower()
+        return body, head
+
+    def _dedup_by_signature(self, candidates) -> list:
+        seen: set[tuple[tuple[str, ...], str]] = set()
+        uniq: list = []
+        for candidate in candidates:
+            sig = self._canonical_signature(candidate.body_relations, candidate.head_relation)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            uniq.append(candidate)
+        return uniq
+
+    @staticmethod
+    def _prune_non_improving_specializations(
+        candidates,
+        parent_support_map: dict[tuple[str, str], int] | None = None,
+    ) -> list:
+        # AMIE+ high-yield pruning:
+        # if adding one more body atom does not reduce support vs 2-body prefix,
+        # the specialization often brings little gain and inflates search space.
+        if not parent_support_map:
+            return list(candidates)
+        pruned: list = []
+        for candidate in candidates:
+            if len(candidate.body_relations) < 3:
+                pruned.append(candidate)
+                continue
+            prefix = (candidate.body_relations[0], candidate.body_relations[1])
+            parent_support = int(parent_support_map.get(prefix, -1))
+            if parent_support >= 0 and candidate.support >= parent_support:
+                continue
+            pruned.append(candidate)
+        return pruned
+
+    def _support_prune_length2_bodies(
+        self,
+        bodies: list[tuple[str, str, int]],
+        min_support: int,
+    ) -> tuple[list[tuple[str, str]], dict[tuple[str, str], int]]:
+        scan_support_map = {(r1, r2): int(sup) for r1, r2, sup in bodies}
+        pairs = list(scan_support_map.keys())
+        support_map = dict(scan_support_map)
+        if hasattr(self._repository, "length2_body_support_for_pairs"):
+            try:
+                support_map = self._repository.length2_body_support_for_pairs(pairs)
+            except Exception:
+                support_map = dict(scan_support_map)
+        kept = [pair for pair in pairs if int(support_map.get(pair, scan_support_map.get(pair, 0))) >= min_support]
+        normalized_support = {
+            pair: int(support_map.get(pair, scan_support_map.get(pair, 0)))
+            for pair in pairs
+        }
+        return kept, normalized_support
+
+    def _support_prune_length3_bodies(
+        self,
+        bodies: list[tuple[str, str, str, int]],
+        min_support: int,
+    ) -> tuple[list[tuple[str, str, str]], dict[tuple[str, str, str], int]]:
+        scan_support_map = {(r1, r2, r3): int(sup) for r1, r2, r3, sup in bodies}
+        triples = list(scan_support_map.keys())
+        support_map = dict(scan_support_map)
+        if hasattr(self._repository, "length3_body_support_for_triples"):
+            try:
+                support_map = self._repository.length3_body_support_for_triples(triples)
+            except Exception:
+                support_map = dict(scan_support_map)
+        kept = [tri for tri in triples if int(support_map.get(tri, scan_support_map.get(tri, 0))) >= min_support]
+        normalized_support = {
+            tri: int(support_map.get(tri, scan_support_map.get(tri, 0)))
+            for tri in triples
+        }
+        return kept, normalized_support
+
+    @staticmethod
+    def _redundancy_prune_length2_bodies(
+        body_pairs: list[tuple[str, str]],
+        support_map: dict[tuple[str, str], int],
+    ) -> list[tuple[str, str]]:
+        # Keep one representative for same (first relation, support) bucket.
+        buckets: dict[tuple[str, int], list[tuple[str, str]]] = defaultdict(list)
+        for pair in body_pairs:
+            buckets[(pair[0], int(support_map.get(pair, 0)))].append(pair)
+        kept: list[tuple[str, str]] = []
+        for items in buckets.values():
+            items_sorted = sorted(items, key=lambda x: (x[1], x[0]))
+            kept.append(items_sorted[0])
+        return sorted(kept)
+
+    @staticmethod
+    def _prune_non_improving_length3_bodies(
+        body_triples: list[tuple[str, str, str]],
+        triple_support_map: dict[tuple[str, str, str], int],
+        prefix_support_map: dict[tuple[str, str], int],
+    ) -> list[tuple[str, str, str]]:
+        kept: list[tuple[str, str, str]] = []
+        for tri in body_triples:
+            prefix = (tri[0], tri[1])
+            parent_support = int(prefix_support_map.get(prefix, -1))
+            tri_support = int(triple_support_map.get(tri, 0))
+            # specialization with unchanged/increased support is usually redundant.
+            if parent_support >= 0 and tri_support >= parent_support:
+                continue
+            kept.append(tri)
+        return kept
+
+    def _relation_functionality(self) -> dict[str, float]:
+        if not hasattr(self._repository, "relation_functionality"):
+            return {}
+        try:
+            data = self._repository.relation_functionality()
+            return {str(k): float(v) for k, v in data.items()}
+        except Exception:
+            return {}
+
+    def _sort_length2_bodies_by_functionality(
+        self,
+        body_pairs: list[tuple[str, str]],
+    ) -> list[tuple[str, str]]:
+        functionality = self._relation_functionality()
+        if not functionality:
+            return sorted(body_pairs)
+        return sorted(
+            body_pairs,
+            key=lambda p: (
+                -(functionality.get(p[0], 0.0) + functionality.get(p[1], 0.0)),
+                -functionality.get(p[0], 0.0),
+                -functionality.get(p[1], 0.0),
+                p[0],
+                p[1],
+            ),
+        )
+
+    def _sort_length3_bodies_by_functionality(
+        self,
+        body_triples: list[tuple[str, str, str]],
+    ) -> list[tuple[str, str, str]]:
+        functionality = self._relation_functionality()
+        if not functionality:
+            return sorted(body_triples)
+        return sorted(
+            body_triples,
+            key=lambda t: (
+                -(functionality.get(t[0], 0.0) + functionality.get(t[1], 0.0) + functionality.get(t[2], 0.0)),
+                -functionality.get(t[0], 0.0),
+                -functionality.get(t[1], 0.0),
+                -functionality.get(t[2], 0.0),
+                t[0],
+                t[1],
+                t[2],
+            ),
+        )
+
+    @staticmethod
+    def _prune_low_confidence_upper_bound(candidates, min_confidence: float) -> list:
+        # Optimistic confidence upper bound: support / max(1, support) = 1 for strict support-only.
+        # We tighten it with observed denominator lower bound from current candidate:
+        # upper_bound <= support / max(1, pca_denominator_lower_bound)
+        # if this upper bound is below threshold, candidate cannot pass later.
+        pruned: list = []
+        for candidate in candidates:
+            denom_lb = max(1, int(candidate.pca_denominator))
+            upper_bound = float(candidate.support) / float(denom_lb)
+            if upper_bound < min_confidence:
+                continue
+            pruned.append(candidate)
+        return pruned
+
     def mine_length2_rules(self, config: MiningConfig) -> list[Rule]:
         # AMIE dangling step (len-2): enumerate body candidates first, then close to head.
         bodies = self._repository.length2_body_candidates(
             limit=config.candidate_limit,
             affected_relations=config.changed_relations,
         )
-        body_pairs = [(r1, r2) for r1, r2, body_support in bodies if body_support >= config.min_support]
+        body_pairs, support_map = self._support_prune_length2_bodies(bodies, config.min_support)
+        body_pairs = self._redundancy_prune_length2_bodies(body_pairs, support_map)
+        body_pairs = self._sort_length2_bodies_by_functionality(body_pairs)[: config.candidate_limit]
         raw_candidates = self._repository.length2_path_rule_candidates_for_bodies(
             body_pairs=body_pairs,
             limit=config.candidate_limit,
         )
+        raw_candidates = self._dedup_by_signature(raw_candidates)
+        raw_candidates = self._prune_low_confidence_upper_bound(raw_candidates, config.min_pca_confidence)
         head_counts = self._repository.head_relation_counts()
         return self._to_rules_from_candidates(raw_candidates, head_counts, config)
 
@@ -132,11 +311,19 @@ class RuleMiningService:
         normalized = [item for item in normalized if item]
         if not normalized:
             return []
-        # Keep same path but force relation filter for impacted relations only.
-        raw_candidates = self._repository.length2_path_rule_candidates_incremental(
+        bodies = self._repository.length2_body_candidates(
             limit=config.candidate_limit,
             affected_relations=normalized,
         )
+        body_pairs, support_map = self._support_prune_length2_bodies(bodies, config.min_support)
+        body_pairs = self._redundancy_prune_length2_bodies(body_pairs, support_map)
+        body_pairs = self._sort_length2_bodies_by_functionality(body_pairs)[: config.candidate_limit]
+        raw_candidates = self._repository.length2_path_rule_candidates_for_bodies(
+            body_pairs=body_pairs,
+            limit=config.candidate_limit,
+        )
+        raw_candidates = self._dedup_by_signature(raw_candidates)
+        raw_candidates = self._prune_low_confidence_upper_bound(raw_candidates, config.min_pca_confidence)
         head_counts = self._repository.head_relation_counts()
         return self._to_rules_from_candidates(raw_candidates, head_counts, config)
 
@@ -157,21 +344,27 @@ class RuleMiningService:
             limit=config.candidate_limit,
             affected_relations=normalized,
         )
-        prefixes = [(r1, r2) for r1, r2, body_support in prefix_bodies if body_support >= config.min_support]
+        prefixes, prefix_support_map = self._support_prune_length2_bodies(prefix_bodies, config.min_support)
+        prefixes = self._redundancy_prune_length2_bodies(prefixes, prefix_support_map)
+        prefixes = self._sort_length2_bodies_by_functionality(prefixes)[: config.candidate_limit]
         len3_bodies = self._repository.length3_body_candidates(
             limit=config.candidate_limit,
             affected_relations=normalized,
             prefixes=prefixes,
         )
-        body_triples = [
-            (r1, r2, r3)
-            for r1, r2, r3, body_support in len3_bodies
-            if body_support >= config.min_support
-        ]
+        body_triples, triple_support_map = self._support_prune_length3_bodies(len3_bodies, config.min_support)
+        body_triples = self._prune_non_improving_length3_bodies(
+            body_triples,
+            triple_support_map,
+            prefix_support_map,
+        )
+        body_triples = self._sort_length3_bodies_by_functionality(body_triples)[: config.candidate_limit]
         raw_candidates = self._repository.length3_path_rule_candidates_for_bodies(
             body_triples=body_triples,
             limit=config.candidate_limit,
         )
+        raw_candidates = self._dedup_by_signature(raw_candidates)
+        raw_candidates = self._prune_low_confidence_upper_bound(raw_candidates, config.min_pca_confidence)
         head_counts = self._repository.head_relation_counts()
         return self._to_rules_from_candidates(raw_candidates, head_counts, config)
 
@@ -184,20 +377,26 @@ class RuleMiningService:
             limit=config.candidate_limit,
             affected_relations=config.changed_relations,
         )
-        prefixes = [(r1, r2) for r1, r2, body_support in prefix_bodies if body_support >= config.min_support]
+        prefixes, prefix_support_map = self._support_prune_length2_bodies(prefix_bodies, config.min_support)
+        prefixes = self._redundancy_prune_length2_bodies(prefixes, prefix_support_map)
+        prefixes = self._sort_length2_bodies_by_functionality(prefixes)[: config.candidate_limit]
         len3_bodies = self._repository.length3_body_candidates(
             limit=config.candidate_limit,
             affected_relations=config.changed_relations,
             prefixes=prefixes,
         )
-        body_triples = [
-            (r1, r2, r3)
-            for r1, r2, r3, body_support in len3_bodies
-            if body_support >= config.min_support
-        ]
+        body_triples, triple_support_map = self._support_prune_length3_bodies(len3_bodies, config.min_support)
+        body_triples = self._prune_non_improving_length3_bodies(
+            body_triples,
+            triple_support_map,
+            prefix_support_map,
+        )
+        body_triples = self._sort_length3_bodies_by_functionality(body_triples)[: config.candidate_limit]
         raw_candidates = self._repository.length3_path_rule_candidates_for_bodies(
             body_triples=body_triples,
             limit=config.candidate_limit,
         )
+        raw_candidates = self._dedup_by_signature(raw_candidates)
+        raw_candidates = self._prune_low_confidence_upper_bound(raw_candidates, config.min_pca_confidence)
         head_counts = self._repository.head_relation_counts()
         return self._to_rules_from_candidates(raw_candidates, head_counts, config)

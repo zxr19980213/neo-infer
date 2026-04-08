@@ -65,6 +65,21 @@ class QueryRepository:
             records = session.run(query)
             return {str(record["relation"]): int(record["freq"]) for record in records}
 
+    def relation_functionality(self) -> dict[str, float]:
+        """Return relation functionality in [0, 1]: distinct_sources / edges."""
+        query = """
+        MATCH (s)-[r]->()
+        WITH type(r) AS relation, count(r) AS edge_count, count(DISTINCT s) AS src_count
+        RETURN relation,
+               CASE WHEN edge_count = 0 THEN 0.0 ELSE toFloat(src_count) / toFloat(edge_count) END AS functionality
+        """
+        with self._driver.session(database=self._database) as session:
+            records = session.run(query)
+            return {
+                str(record["relation"]): float(record["functionality"])
+                for record in records
+            }
+
     @staticmethod
     def _batch_length2_pca_denominators(session, phase1_records) -> dict[tuple[str, str, str], int]:
         by_head: dict[str, set[tuple[str, str]]] = {}

@@ -10,6 +10,8 @@ class StubRepo:
         self.length2_closing_pairs = None
         self.length3_bodies_called_with = None
         self.length3_closing_triples = None
+        self.length2_body_support_called_with = None
+        self.length3_body_support_called_with = None
 
     def head_relation_counts(self) -> dict[str, int]:
         return {"nationality": 10, "region": 10}
@@ -31,6 +33,13 @@ class StubRepo:
                 pca_denominator=3,
             )
         ]
+
+    def length2_body_support_for_pairs(self, body_pairs: list[tuple[str, str]]):
+        self.length2_body_support_called_with = body_pairs
+        return {
+            ("bornIn", "locatedIn"): 3,
+            ("low", "support"): 1,
+        }
 
     def length2_path_rule_candidates_incremental(self, limit: int, affected_relations: list[str]):
         return [
@@ -69,6 +78,13 @@ class StubRepo:
             )
         ]
 
+    def length3_body_support_for_triples(self, body_triples: list[tuple[str, str, str]]):
+        self.length3_body_support_called_with = body_triples
+        return {
+            ("bornIn", "locatedIn", "partOf"): 2,
+            ("low", "support", "x"): 1,
+        }
+
 
 def test_length2_uses_dangling_then_closing_with_support_pruning():
     repo = StubRepo()
@@ -84,6 +100,7 @@ def test_length2_uses_dangling_then_closing_with_support_pruning():
     rules = miner.mine_length2_rules(config)
 
     assert repo.length2_bodies_called_with == {"limit": 100, "affected_relations": None}
+    assert repo.length2_body_support_called_with == [("bornIn", "locatedIn"), ("low", "support")]
     assert repo.length2_closing_pairs == {"pairs": [("bornIn", "locatedIn")], "limit": 100}
     assert len(rules) == 1
     assert rules[0].body_relations == ("bornIn", "locatedIn")
@@ -109,6 +126,10 @@ def test_length3_incremental_uses_prefix_expansion_and_pruning():
         "affected_relations": ["bornIn", "partOf"],
         "prefixes": [("bornIn", "locatedIn")],
     }
+    assert repo.length3_body_support_called_with == [
+        ("bornIn", "locatedIn", "partOf"),
+        ("low", "support", "x"),
+    ]
     # Closing only receives len-3 bodies passing support pruning.
     assert repo.length3_closing_triples == {
         "triples": [("bornIn", "locatedIn", "partOf")],
@@ -117,3 +138,39 @@ def test_length3_incremental_uses_prefix_expansion_and_pruning():
     assert len(rules) == 1
     assert len(rules[0].body_relations) == 3
     assert rules[0].head_relation == "region"
+
+
+def test_length2_redundancy_pruning_removes_same_support_specialization():
+    class Repo(StubRepo):
+        def length2_body_candidates(self, limit: int = 5000, affected_relations: list[str] | None = None):
+            self.length2_bodies_called_with = {"limit": limit, "affected_relations": affected_relations}
+            return [
+                ("bornIn", "locatedIn", 3),
+                ("bornIn", "locatedInX", 3),
+            ]
+
+        def length2_body_support_for_pairs(self, body_pairs: list[tuple[str, str]]):
+            self.length2_body_support_called_with = body_pairs
+            return {
+                ("bornIn", "locatedIn"): 3,
+                ("bornIn", "locatedInX"): 3,
+            }
+
+        def length2_path_rule_candidates_for_bodies(self, body_pairs: list[tuple[str, str]], limit: int = 5000):
+            self.length2_closing_pairs = {"pairs": body_pairs, "limit": limit}
+            return [
+                PathRuleCandidate(
+                    body_relations=("bornIn", body_pairs[0][1]),
+                    head_relation="nationality",
+                    support=3,
+                    pca_denominator=3,
+                )
+            ]
+
+    repo = Repo()
+    miner = RuleMiningService(repo)  # type: ignore[arg-type]
+    config = MiningConfig(min_support=2, min_pca_confidence=0.1, top_k=50, candidate_limit=100, body_length=2)
+    rules = miner.mine_length2_rules(config)
+    # Redundancy pruning keeps only one specialization for the same prefix/support signature.
+    assert repo.length2_closing_pairs["pairs"] == [("bornIn", "locatedIn")]
+    assert len(rules) == 1
