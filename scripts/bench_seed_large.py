@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import time
 from collections import defaultdict
 
 from neo4j import GraphDatabase
@@ -24,6 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-university", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch-size", type=int, default=2000)
+    parser.add_argument("--progress-every", type=int, default=10)
     return parser.parse_args()
 
 
@@ -32,31 +34,50 @@ def chunked(items: list[dict[str, str]], batch_size: int):
         yield items[i : i + batch_size]
 
 
-def upsert_entities(session, label: str, ids: list[str], batch_size: int) -> None:
+def upsert_entities(
+    session,
+    label: str,
+    ids: list[str],
+    batch_size: int,
+    progress_every: int,
+) -> None:
     query = f"""
     UNWIND $rows AS row
     MERGE (n:{label} {{id: row.id}})
     """
     rows = [{"id": item} for item in ids]
-    for batch in chunked(rows, batch_size):
+    total_batches = (len(rows) + batch_size - 1) // batch_size
+    for i, batch in enumerate(chunked(rows, batch_size), start=1):
         session.run(query, {"rows": batch}).consume()
+        if i == 1 or i % progress_every == 0 or i == total_batches:
+            print(f"[seed] entities {label}: batch {i}/{total_batches}", flush=True)
 
 
-def upsert_rels(session, rel_type: str, pairs: list[tuple[str, str]], batch_size: int) -> None:
+def upsert_rels(
+    session,
+    rel_type: str,
+    pairs: list[tuple[str, str]],
+    batch_size: int,
+    progress_every: int,
+) -> None:
     query = f"""
     UNWIND $rows AS row
-    MATCH (s {{id: row.src}})
-    MATCH (t {{id: row.dst}})
+    MATCH (s:Entity {{id: row.src}})
+    MATCH (t:Entity {{id: row.dst}})
     MERGE (s)-[:`{rel_type}`]->(t)
     """
     rows = [{"src": s, "dst": t} for s, t in pairs]
-    for batch in chunked(rows, batch_size):
+    total_batches = (len(rows) + batch_size - 1) // batch_size
+    for i, batch in enumerate(chunked(rows, batch_size), start=1):
         session.run(query, {"rows": batch}).consume()
+        if i == 1 or i % progress_every == 0 or i == total_batches:
+            print(f"[seed] rel {rel_type}: batch {i}/{total_batches}", flush=True)
 
 
 def main() -> None:
     args = parse_args()
     rng = random.Random(args.seed)
+    t0 = time.perf_counter()
 
     persons = [f"person_{i}" for i in range(args.num_person)]
     cities = [f"city_{i}" for i in range(args.num_city)]
@@ -72,7 +93,15 @@ def main() -> None:
     with driver.session(database=args.database) as session:
         try:
             if args.reset:
+                print("[seed] reset graph...", flush=True)
                 session.run("MATCH (n) DETACH DELETE n").consume()
+            # Critical for large write throughput on relationship insertion.
+            session.run(
+                """
+                CREATE CONSTRAINT entity_id_unique IF NOT EXISTS
+                FOR (e:Entity) REQUIRE e.id IS UNIQUE
+                """
+            ).consume()
         except AuthError as exc:
             raise SystemExit(
                 "[bench_seed_large] Neo4j authentication failed. "
@@ -82,12 +111,13 @@ def main() -> None:
                 "or set env vars NEO4J_URI/NEO4J_USER/NEO4J_PASSWORD/NEO4J_DATABASE."
             ) from exc
 
-        upsert_entities(session, "Entity", persons, args.batch_size)
-        upsert_entities(session, "Entity", cities, args.batch_size)
-        upsert_entities(session, "Entity", countries, args.batch_size)
-        upsert_entities(session, "Entity", regions, args.batch_size)
-        upsert_entities(session, "Entity", companies, args.batch_size)
-        upsert_entities(session, "Entity", universities, args.batch_size)
+        print("[seed] upserting entity nodes...", flush=True)
+        upsert_entities(session, "Entity", persons, args.batch_size, args.progress_every)
+        upsert_entities(session, "Entity", cities, args.batch_size, args.progress_every)
+        upsert_entities(session, "Entity", countries, args.batch_size, args.progress_every)
+        upsert_entities(session, "Entity", regions, args.batch_size, args.progress_every)
+        upsert_entities(session, "Entity", companies, args.batch_size, args.progress_every)
+        upsert_entities(session, "Entity", universities, args.batch_size, args.progress_every)
 
         city_to_country: dict[str, str] = {}
         country_to_region: dict[str, str] = {}
@@ -102,10 +132,13 @@ def main() -> None:
         works_at: list[tuple[str, str]] = []
         educated_at: list[tuple[str, str]] = []
         lives_in: list[tuple[str, str]] = []
+        person_to_country: dict[str, str] = {}
 
+        print("[seed] generating synthetic relationship payloads...", flush=True)
         for person in persons:
             city = cities[rng.randrange(len(cities))]
             country = city_to_country[city]
+            person_to_country[person] = country
             born_in.append((person, city))
             nationality.append((person, country))
             lives_in.append((person, city))
@@ -119,7 +152,7 @@ def main() -> None:
 
         works_at_country: dict[str, set[str]] = defaultdict(set)
         for person, company in works_at:
-            works_at_country[company].add(nationality[persons.index(person)][1])
+            works_at_country[company].add(person_to_country[person])
 
         headquarters_in: list[tuple[str, str]] = []
         for company in companies:
@@ -129,18 +162,20 @@ def main() -> None:
             else:
                 headquarters_in.append((company, countries[rng.randrange(len(countries))]))
 
-        upsert_rels(session, "locatedIn", located_in, args.batch_size)
-        upsert_rels(session, "partOf", part_of, args.batch_size)
-        upsert_rels(session, "bornIn", born_in, args.batch_size)
-        upsert_rels(session, "nationality", nationality, args.batch_size)
-        upsert_rels(session, "noNationality", no_nationality, args.batch_size)
-        upsert_rels(session, "worksAt", works_at, args.batch_size)
-        upsert_rels(session, "educatedAt", educated_at, args.batch_size)
-        upsert_rels(session, "livesIn", lives_in, args.batch_size)
-        upsert_rels(session, "headquartersIn", headquarters_in, args.batch_size)
+        print("[seed] upserting relationships...", flush=True)
+        upsert_rels(session, "locatedIn", located_in, args.batch_size, args.progress_every)
+        upsert_rels(session, "partOf", part_of, args.batch_size, args.progress_every)
+        upsert_rels(session, "bornIn", born_in, args.batch_size, args.progress_every)
+        upsert_rels(session, "nationality", nationality, args.batch_size, args.progress_every)
+        upsert_rels(session, "noNationality", no_nationality, args.batch_size, args.progress_every)
+        upsert_rels(session, "worksAt", works_at, args.batch_size, args.progress_every)
+        upsert_rels(session, "educatedAt", educated_at, args.batch_size, args.progress_every)
+        upsert_rels(session, "livesIn", lives_in, args.batch_size, args.progress_every)
+        upsert_rels(session, "headquartersIn", headquarters_in, args.batch_size, args.progress_every)
 
     driver.close()
-    print("seed completed")
+    elapsed = time.perf_counter() - t0
+    print(f"[seed] completed in {elapsed:.2f}s", flush=True)
 
 
 if __name__ == "__main__":
