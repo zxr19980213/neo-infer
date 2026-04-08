@@ -15,6 +15,7 @@ set -euo pipefail
 #   SMOKE_HEALTH_RETRIES default: 20
 #   SMOKE_HEALTH_INTERVAL default: 1
 #   SMOKE_CURL_TIMEOUT  default: 3
+#   SMOKE_DEBUG         default: 0   (set 1 to enable bash -x)
 
 API_BASE_URL="${API_BASE_URL:-http://127.0.0.1:8000}"
 NEO4J_URI="${NEO4J_URI:-bolt://127.0.0.1:7687}"
@@ -28,8 +29,15 @@ SMOKE_SCHEMA_STRICT="${SMOKE_SCHEMA_STRICT:-0}"
 SMOKE_HEALTH_RETRIES="${SMOKE_HEALTH_RETRIES:-20}"
 SMOKE_HEALTH_INTERVAL="${SMOKE_HEALTH_INTERVAL:-1}"
 SMOKE_CURL_TIMEOUT="${SMOKE_CURL_TIMEOUT:-3}"
+SMOKE_DEBUG="${SMOKE_DEBUG:-0}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [[ "$SMOKE_DEBUG" == "1" ]]; then
+  set -x
+fi
+
+trap 'printf "[smoke] failed at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
 log() {
   printf '[smoke] %s\n' "$*"
@@ -57,9 +65,7 @@ detect_python() {
 
 run_cypher() {
   local query="$1"
-  if command -v cypher-shell >/dev/null 2>&1; then
-    cypher-shell -a "$NEO4J_URI" -u "$NEO4J_USER" -p "$NEO4J_PASSWORD" -d "$NEO4J_DATABASE" "$query" >/dev/null
-  else
+  if "$PYTHON_BIN" -c "import neo4j" >/dev/null 2>&1; then
     CYPHER_QUERY="$query" \
     NEO4J_URI="$NEO4J_URI" \
     NEO4J_USER="$NEO4J_USER" \
@@ -67,6 +73,8 @@ run_cypher() {
     NEO4J_DATABASE="$NEO4J_DATABASE" \
     "$PYTHON_BIN" - <<'PY'
 import os
+import sys
+import traceback
 from neo4j import GraphDatabase
 
 uri = os.environ["NEO4J_URI"]
@@ -74,12 +82,20 @@ user = os.environ["NEO4J_USER"]
 password = os.environ["NEO4J_PASSWORD"]
 database = os.environ["NEO4J_DATABASE"]
 query = os.environ["CYPHER_QUERY"]
-
-driver = GraphDatabase.driver(uri, auth=(user, password))
-with driver.session(database=database) as session:
-    session.run(query).consume()
-driver.close()
+try:
+    driver = GraphDatabase.driver(uri, auth=(user, password))
+    with driver.session(database=database) as session:
+        session.run(query).consume()
+    driver.close()
+except Exception:
+    traceback.print_exc()
+    sys.exit(1)
 PY
+  elif command -v cypher-shell >/dev/null 2>&1; then
+    cypher-shell -a "$NEO4J_URI" -u "$NEO4J_USER" -p "$NEO4J_PASSWORD" -d "$NEO4J_DATABASE" "$query"
+  else
+    printf '[smoke] neither neo4j python driver nor cypher-shell is available\n' >&2
+    exit 1
   fi
 }
 
@@ -111,7 +127,7 @@ http_json() {
 json_assert() {
   local body="$1"
   local expr="$2"
-  JSON_BODY="$body" python3 - "$expr" <<'PY'
+  JSON_BODY="$body" "$PYTHON_BIN" - "$expr" <<'PY'
 import json
 import os
 import sys
@@ -146,7 +162,7 @@ PY
 extract_json() {
   local body="$1"
   local py="$2"
-  JSON_BODY="$body" python3 - "$py" <<'PY'
+  JSON_BODY="$body" "$PYTHON_BIN" - "$py" <<'PY'
 import json
 import os
 import sys
