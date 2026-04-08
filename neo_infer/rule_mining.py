@@ -16,6 +16,13 @@ class MiningConfig:
     candidate_limit: int = 2000
     body_length: int = 2
     changed_relations: list[str] | None = None
+    # AMIE+ search-space controls:
+    # - beam_width: keep top-B body candidates per expansion level.
+    # - head_budget_per_relation: keep at most K rules per head relation.
+    # - confidence_ub_weight: local-stat tightening strength for confidence UB.
+    beam_width: int | None = None
+    head_budget_per_relation: int | None = None
+    confidence_ub_weight: float = 0.0
 
 
 class RuleMiningService:
@@ -224,16 +231,118 @@ class RuleMiningService:
             ),
         )
 
+    def _apply_beam_budget_length2(
+        self,
+        body_pairs: list[tuple[str, str]],
+        support_map: dict[tuple[str, str], int],
+        beam_width: int | None,
+    ) -> list[tuple[str, str]]:
+        if not beam_width or beam_width <= 0 or len(body_pairs) <= beam_width:
+            return body_pairs
+        functionality = self._relation_functionality()
+        ranked = sorted(
+            body_pairs,
+            key=lambda pair: (
+                -int(support_map.get(pair, 0)),
+                -(functionality.get(pair[0], 0.0) + functionality.get(pair[1], 0.0)),
+                -functionality.get(pair[0], 0.0),
+                -functionality.get(pair[1], 0.0),
+                pair[0],
+                pair[1],
+            ),
+        )
+        return ranked[:beam_width]
+
+    def _apply_beam_budget_length3(
+        self,
+        body_triples: list[tuple[str, str, str]],
+        support_map: dict[tuple[str, str, str], int],
+        beam_width: int | None,
+    ) -> list[tuple[str, str, str]]:
+        if not beam_width or beam_width <= 0 or len(body_triples) <= beam_width:
+            return body_triples
+        functionality = self._relation_functionality()
+        ranked = sorted(
+            body_triples,
+            key=lambda tri: (
+                -int(support_map.get(tri, 0)),
+                -(functionality.get(tri[0], 0.0) + functionality.get(tri[1], 0.0) + functionality.get(tri[2], 0.0)),
+                -functionality.get(tri[0], 0.0),
+                -functionality.get(tri[1], 0.0),
+                -functionality.get(tri[2], 0.0),
+                tri[0],
+                tri[1],
+                tri[2],
+            ),
+        )
+        return ranked[:beam_width]
+
     @staticmethod
-    def _prune_low_confidence_upper_bound(candidates, min_confidence: float) -> list:
-        # Optimistic confidence upper bound: support / max(1, support) = 1 for strict support-only.
-        # We tighten it with observed denominator lower bound from current candidate:
-        # upper_bound <= support / max(1, pca_denominator_lower_bound)
-        # if this upper bound is below threshold, candidate cannot pass later.
-        pruned: list = []
+    def _apply_head_bucket_budget(candidates, per_head_budget: int | None) -> list:
+        if not per_head_budget or per_head_budget <= 0:
+            return list(candidates)
+        buckets: dict[str, list] = defaultdict(list)
         for candidate in candidates:
+            buckets[candidate.head_relation].append(candidate)
+
+        kept: list = []
+        for items in buckets.values():
+            ranked = sorted(
+                items,
+                key=lambda candidate: (
+                    -candidate.pca_confidence,
+                    -int(candidate.support),
+                    int(candidate.pca_denominator),
+                    candidate.body_relations,
+                ),
+            )
+            kept.extend(ranked[:per_head_budget])
+        kept.sort(
+            key=lambda candidate: (
+                -candidate.pca_confidence,
+                -int(candidate.support),
+                int(candidate.pca_denominator),
+                candidate.body_relations,
+                candidate.head_relation,
+            )
+        )
+        return kept
+
+    @staticmethod
+    def _prune_low_confidence_upper_bound(
+        candidates,
+        min_confidence: float,
+        confidence_ub_weight: float = 0.0,
+    ) -> list:
+        # Optimistic confidence upper bound: support / max(1, support) = 1 for strict support-only.
+        # Here we start from exact candidate denominator (safe bound), then optionally
+        # tighten with per-head local denominator ratio statistics.
+        pruned: list = []
+        weight = max(0.0, min(1.0, float(confidence_ub_weight)))
+        ratio_by_head: dict[str, float] = {}
+        if weight > 0.0:
+            ratio_sum: dict[str, float] = defaultdict(float)
+            ratio_cnt: dict[str, int] = defaultdict(int)
+            for candidate in candidates:
+                support = max(1, int(candidate.support))
+                denom = max(1, int(candidate.pca_denominator))
+                ratio_sum[candidate.head_relation] += float(denom) / float(support)
+                ratio_cnt[candidate.head_relation] += 1
+            ratio_by_head = {
+                head: (ratio_sum[head] / float(ratio_cnt[head])) if ratio_cnt[head] > 0 else 1.0
+                for head in ratio_sum
+            }
+
+        for candidate in candidates:
+            support = max(1, int(candidate.support))
             denom_lb = max(1, int(candidate.pca_denominator))
-            upper_bound = float(candidate.support) / float(denom_lb)
+            effective_denom = denom_lb
+            if weight > 0.0:
+                local_ratio = max(1.0, float(ratio_by_head.get(candidate.head_relation, 1.0)))
+                local_expected = int(round(float(support) * local_ratio))
+                blended = int(round((1.0 - weight) * float(denom_lb) + weight * float(local_expected)))
+                effective_denom = max(denom_lb, max(1, blended))
+            upper_bound = float(candidate.support) / float(effective_denom)
             if upper_bound < min_confidence:
                 continue
             pruned.append(candidate)
@@ -247,13 +356,20 @@ class RuleMiningService:
         )
         body_pairs, support_map = self._support_prune_length2_bodies(bodies, config.min_support)
         body_pairs = self._redundancy_prune_length2_bodies(body_pairs, support_map)
-        body_pairs = self._sort_length2_bodies_by_functionality(body_pairs)[: config.candidate_limit]
+        body_pairs = self._sort_length2_bodies_by_functionality(body_pairs)
+        body_pairs = self._apply_beam_budget_length2(body_pairs, support_map, config.beam_width)
+        body_pairs = body_pairs[: config.candidate_limit]
         raw_candidates = self._repository.length2_path_rule_candidates_for_bodies(
             body_pairs=body_pairs,
             limit=config.candidate_limit,
         )
         raw_candidates = self._dedup_by_signature(raw_candidates)
-        raw_candidates = self._prune_low_confidence_upper_bound(raw_candidates, config.min_pca_confidence)
+        raw_candidates = self._prune_low_confidence_upper_bound(
+            raw_candidates,
+            config.min_pca_confidence,
+            config.confidence_ub_weight,
+        )
+        raw_candidates = self._apply_head_bucket_budget(raw_candidates, config.head_budget_per_relation)
         head_counts = self._repository.head_relation_counts()
         return self._to_rules_from_candidates(raw_candidates, head_counts, config)
 
@@ -317,13 +433,20 @@ class RuleMiningService:
         )
         body_pairs, support_map = self._support_prune_length2_bodies(bodies, config.min_support)
         body_pairs = self._redundancy_prune_length2_bodies(body_pairs, support_map)
-        body_pairs = self._sort_length2_bodies_by_functionality(body_pairs)[: config.candidate_limit]
+        body_pairs = self._sort_length2_bodies_by_functionality(body_pairs)
+        body_pairs = self._apply_beam_budget_length2(body_pairs, support_map, config.beam_width)
+        body_pairs = body_pairs[: config.candidate_limit]
         raw_candidates = self._repository.length2_path_rule_candidates_for_bodies(
             body_pairs=body_pairs,
             limit=config.candidate_limit,
         )
         raw_candidates = self._dedup_by_signature(raw_candidates)
-        raw_candidates = self._prune_low_confidence_upper_bound(raw_candidates, config.min_pca_confidence)
+        raw_candidates = self._prune_low_confidence_upper_bound(
+            raw_candidates,
+            config.min_pca_confidence,
+            config.confidence_ub_weight,
+        )
+        raw_candidates = self._apply_head_bucket_budget(raw_candidates, config.head_budget_per_relation)
         head_counts = self._repository.head_relation_counts()
         return self._to_rules_from_candidates(raw_candidates, head_counts, config)
 
@@ -358,13 +481,20 @@ class RuleMiningService:
             triple_support_map,
             prefix_support_map,
         )
-        body_triples = self._sort_length3_bodies_by_functionality(body_triples)[: config.candidate_limit]
+        body_triples = self._sort_length3_bodies_by_functionality(body_triples)
+        body_triples = self._apply_beam_budget_length3(body_triples, triple_support_map, config.beam_width)
+        body_triples = body_triples[: config.candidate_limit]
         raw_candidates = self._repository.length3_path_rule_candidates_for_bodies(
             body_triples=body_triples,
             limit=config.candidate_limit,
         )
         raw_candidates = self._dedup_by_signature(raw_candidates)
-        raw_candidates = self._prune_low_confidence_upper_bound(raw_candidates, config.min_pca_confidence)
+        raw_candidates = self._prune_low_confidence_upper_bound(
+            raw_candidates,
+            config.min_pca_confidence,
+            config.confidence_ub_weight,
+        )
+        raw_candidates = self._apply_head_bucket_budget(raw_candidates, config.head_budget_per_relation)
         head_counts = self._repository.head_relation_counts()
         return self._to_rules_from_candidates(raw_candidates, head_counts, config)
 
@@ -391,12 +521,19 @@ class RuleMiningService:
             triple_support_map,
             prefix_support_map,
         )
-        body_triples = self._sort_length3_bodies_by_functionality(body_triples)[: config.candidate_limit]
+        body_triples = self._sort_length3_bodies_by_functionality(body_triples)
+        body_triples = self._apply_beam_budget_length3(body_triples, triple_support_map, config.beam_width)
+        body_triples = body_triples[: config.candidate_limit]
         raw_candidates = self._repository.length3_path_rule_candidates_for_bodies(
             body_triples=body_triples,
             limit=config.candidate_limit,
         )
         raw_candidates = self._dedup_by_signature(raw_candidates)
-        raw_candidates = self._prune_low_confidence_upper_bound(raw_candidates, config.min_pca_confidence)
+        raw_candidates = self._prune_low_confidence_upper_bound(
+            raw_candidates,
+            config.min_pca_confidence,
+            config.confidence_ub_weight,
+        )
+        raw_candidates = self._apply_head_bucket_budget(raw_candidates, config.head_budget_per_relation)
         head_counts = self._repository.head_relation_counts()
         return self._to_rules_from_candidates(raw_candidates, head_counts, config)

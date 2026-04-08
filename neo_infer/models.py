@@ -54,6 +54,9 @@ class MineRulesRequest(BaseModel):
     min_pca_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     min_head_coverage: float | None = Field(default=None, ge=0.0, le=1.0)
     candidate_limit: int | None = Field(default=None, ge=1, le=50000)
+    beam_width: int | None = Field(default=None, ge=1, le=50000)
+    head_budget_per_relation: int | None = Field(default=None, ge=1, le=50000)
+    confidence_ub_weight: float = Field(default=0.0, ge=0.0, le=1.0)
     body_length: int = Field(default=2, ge=2, le=3)
     changed_relations: list[str] | None = None
 

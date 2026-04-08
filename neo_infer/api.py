@@ -12,6 +12,7 @@ from neo_infer.models import (
     ChangeEdge,
     ChangeLogAppendRequest,
     ChangeLogPendingResponse,
+    EdgeDeltaApplyRequest,
     IncrementalConsumeRequest,
     IncrementalConsumeResponse,
     ConflictCaseListResponse,
@@ -51,6 +52,52 @@ def ensure_neo4j_schema(db: Neo4jClient) -> None:
         db.run_write(statement)
 
 
+def _append_changes_compat(
+    store: IncrementalStore,
+    *,
+    added: list[ChangeEdge],
+    removed: list[ChangeEdge],
+) -> None:
+    """Support both new and legacy IncrementalStore append signatures."""
+    try:
+        store.append_changes(added_edges=added, removed_edges=removed)
+        return
+    except TypeError:
+        pass
+
+    legacy_changes = [
+        {"op": "add", "src": edge.src, "rel": edge.rel, "dst": edge.dst}
+        for edge in added
+    ] + [
+        {"op": "remove", "src": edge.src, "rel": edge.rel, "dst": edge.dst}
+        for edge in removed
+    ]
+    store.append_changes(legacy_changes)
+
+
+def _legacy_pending_relations(store: IncrementalStore) -> tuple[list[str], int]:
+    """Read pending relations from legacy changelog queue if available."""
+    if not hasattr(store, "fetch_unprocessed_changes"):
+        return [], 0
+    try:
+        pending = store.fetch_unprocessed_changes()
+    except Exception:
+        return [], 0
+    if not pending:
+        return [], 0
+
+    relations: set[str] = set()
+    for item in pending:
+        rel = ""
+        if isinstance(item, dict):
+            rel = str(item.get("rel", "")).strip()
+        else:
+            rel = str(getattr(item, "rel", "")).strip()
+        if rel:
+            relations.add(rel)
+    return sorted(relations), len(pending)
+
+
 def get_db(settings: Settings = Depends(get_settings)) -> Neo4jClient:
     return Neo4jClient(settings)
 
@@ -88,6 +135,9 @@ def mine_rules(
         min_head_coverage=payload.min_head_coverage or 0.0,
         top_k=payload.limit,
         candidate_limit=payload.candidate_limit or max(payload.limit * 20, 100),
+        beam_width=payload.beam_width,
+        head_budget_per_relation=payload.head_budget_per_relation,
+        confidence_ub_weight=payload.confidence_ub_weight,
     )
     if payload.body_length == 3:
         discovered = miner.mine_length3_rules(config)
@@ -112,15 +162,58 @@ def append_changes(
         dst = getattr(item, "dst", None) or getattr(item, "dst_id", None) or ""
         return ChangeEdge(src=str(src), rel=str(rel), dst=str(dst))
 
-    store.append_changes(
-        added_edges=[_edge_from_item(item) for item in payload.added_edges],
-        removed_edges=[_edge_from_item(item) for item in payload.removed_edges],
-    )
+    added = [_edge_from_item(item) for item in payload.added_edges]
+    removed = [_edge_from_item(item) for item in payload.removed_edges]
+    _append_changes_compat(store, added=added, removed=removed)
     pending = store.pending_changes(limit=1000)
     return ChangeLogPendingResponse(
         pending_count=len(pending),
         entries=pending,
     )
+
+
+@app.post("/changes/log")
+def append_changes_legacy_log(
+    payload: EdgeDeltaApplyRequest,
+    settings: Settings = Depends(get_settings),
+    db: Neo4jClient = Depends(get_db),
+) -> dict[str, int]:
+    _ = settings
+    store = IncrementalStore(db)
+    added = [ChangeEdge(src=item.src_id, rel=item.rel, dst=item.dst_id, created_at=item.created_at) for item in payload.added_edges]
+    removed = [
+        ChangeEdge(src=item.src_id, rel=item.rel, dst=item.dst_id, created_at=item.created_at)
+        for item in payload.removed_edges
+    ]
+    _append_changes_compat(store, added=added, removed=removed)
+    return {"added": len(added), "removed": len(removed)}
+
+
+@app.post("/changelog/append")
+def append_changes_legacy_batch(
+    payload: dict,
+    settings: Settings = Depends(get_settings),
+    db: Neo4jClient = Depends(get_db),
+) -> dict[str, int]:
+    _ = settings
+    changes = payload.get("changes", []) if isinstance(payload, dict) else []
+    added: list[ChangeEdge] = []
+    removed: list[ChangeEdge] = []
+    for item in changes:
+        if not isinstance(item, dict):
+            continue
+        op = str(item.get("op", "add")).lower()
+        edge = ChangeEdge(
+            src=str(item.get("src", "")),
+            rel=str(item.get("rel", "")),
+            dst=str(item.get("dst", "")),
+        )
+        if op == "remove":
+            removed.append(edge)
+        else:
+            added.append(edge)
+    _append_changes_compat(IncrementalStore(db), added=added, removed=removed)
+    return {"appended": len(added) + len(removed)}
 
 
 @app.post("/rules/mine/length3", response_model=MineRulesResponse)
@@ -141,6 +234,9 @@ def mine_rules_length3(
         min_head_coverage=payload.min_head_coverage or 0.0,
         top_k=payload.limit,
         candidate_limit=payload.candidate_limit or max(payload.limit * 20, 100),
+        beam_width=payload.beam_width,
+        head_budget_per_relation=payload.head_budget_per_relation,
+        confidence_ub_weight=payload.confidence_ub_weight,
     )
     discovered = miner.mine_length3_rules(config)
     RuleStore(db).upsert_rules(discovered)
@@ -165,6 +261,9 @@ def mine_rules_incremental_length2(
             min_pca_confidence=payload.min_pca_confidence,
             min_head_coverage=payload.min_head_coverage,
             candidate_limit=payload.candidate_limit,
+            beam_width=payload.beam_width,
+            head_budget_per_relation=payload.head_budget_per_relation,
+            confidence_ub_weight=payload.confidence_ub_weight,
             body_length=2,
             changed_relations=payload.affected_relations,
         ),
@@ -191,6 +290,9 @@ def mine_rules_incremental_length3(
             min_pca_confidence=payload.min_pca_confidence,
             min_head_coverage=payload.min_head_coverage,
             candidate_limit=payload.candidate_limit,
+            beam_width=payload.beam_width,
+            head_budget_per_relation=payload.head_budget_per_relation,
+            confidence_ub_weight=payload.confidence_ub_weight,
             body_length=3,
             changed_relations=payload.affected_relations,
         ),
@@ -221,6 +323,9 @@ def mine_rules_incremental_from_changelog(
         ),
         min_head_coverage=payload.min_head_coverage or 0.0,
         candidate_limit=payload.candidate_limit,
+        beam_width=payload.beam_width,
+        head_budget_per_relation=payload.head_budget_per_relation,
+        confidence_ub_weight=payload.confidence_ub_weight,
         body_length=payload.body_length,
         changed_relations=payload.changed_relations,
     )
@@ -230,6 +335,52 @@ def mine_rules_incremental_from_changelog(
         affected_relations=result.affected_relations,
         rules=result.rules,
     )
+
+
+@app.post("/rules/mine/incremental/changelog")
+def mine_rules_incremental_changelog_legacy(
+    payload: IncrementalConsumeRequest,
+    settings: Settings = Depends(get_settings),
+    db: Neo4jClient = Depends(get_db),
+) -> dict:
+    result = mine_rules_incremental_from_changelog(payload=payload, settings=settings, db=db)
+    return {
+        "processed_changes": result.processed_changes,
+        "affected_relations": result.affected_relations,
+        "rules": [rule.model_dump() for rule in result.rules],
+    }
+
+
+@app.post("/rules/mine/incremental/consume/length2")
+def mine_rules_incremental_consume_length2_legacy(
+    payload: IncrementalMineRequest,
+    settings: Settings = Depends(get_settings),
+    db: Neo4jClient = Depends(get_db),
+) -> dict:
+    # Legacy endpoint: consume queued changelog directly.
+    store = IncrementalStore(db)
+    legacy_relations, legacy_pending_count = _legacy_pending_relations(store)
+    changed_relations = payload.changed_relations or payload.affected_relations or legacy_relations
+    consume_payload = IncrementalConsumeRequest(
+        limit=payload.limit,
+        min_support=payload.min_support,
+        min_pca_confidence=payload.min_pca_confidence,
+        min_head_coverage=payload.min_head_coverage,
+        candidate_limit=payload.candidate_limit,
+        beam_width=payload.beam_width,
+        head_budget_per_relation=payload.head_budget_per_relation,
+        confidence_ub_weight=payload.confidence_ub_weight,
+        body_length=2,
+        changed_relations=changed_relations,
+        change_limit=payload.change_limit,
+    )
+    result = mine_rules_incremental_from_changelog(payload=consume_payload, settings=settings, db=db)
+    if legacy_pending_count > 0 and hasattr(store, "mark_changes_processed"):
+        try:
+            store.mark_changes_processed(legacy_pending_count)
+        except Exception:
+            pass
+    return {"rules": [rule.model_dump() for rule in result.rules]}
 
 
 @app.get("/rules", response_model=RuleSetResponse)
