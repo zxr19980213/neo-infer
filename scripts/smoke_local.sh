@@ -11,6 +11,9 @@ set -euo pipefail
 #   SMOKE_RESET_DB      default: 0   (set 1 to clear graph first)
 #   SMOKE_INIT_DATA     default: 1   (set 0 to skip seed data)
 #   SMOKE_APPLY_SCHEMA  default: 1   (set 0 to skip schema bootstrap script)
+#   SMOKE_HEALTH_RETRIES default: 20
+#   SMOKE_HEALTH_INTERVAL default: 1
+#   SMOKE_CURL_TIMEOUT  default: 3
 
 API_BASE_URL="${API_BASE_URL:-http://127.0.0.1:8000}"
 NEO4J_URI="${NEO4J_URI:-bolt://127.0.0.1:7687}"
@@ -20,6 +23,9 @@ NEO4J_DATABASE="${NEO4J_DATABASE:-neo4j}"
 SMOKE_RESET_DB="${SMOKE_RESET_DB:-0}"
 SMOKE_INIT_DATA="${SMOKE_INIT_DATA:-1}"
 SMOKE_APPLY_SCHEMA="${SMOKE_APPLY_SCHEMA:-1}"
+SMOKE_HEALTH_RETRIES="${SMOKE_HEALTH_RETRIES:-20}"
+SMOKE_HEALTH_INTERVAL="${SMOKE_HEALTH_INTERVAL:-1}"
+SMOKE_CURL_TIMEOUT="${SMOKE_CURL_TIMEOUT:-3}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -138,14 +144,17 @@ PY
 
 wait_health() {
   local n=0
-  until curl -sS "${API_BASE_URL}/health" >/dev/null 2>&1; do
+  log "wait API health: ${API_BASE_URL}/health"
+  until curl -sS --connect-timeout 1 --max-time "$SMOKE_CURL_TIMEOUT" "${API_BASE_URL}/health" >/dev/null 2>&1; do
     n=$((n + 1))
-    if [[ "$n" -ge 20 ]]; then
-      printf '[smoke] API not ready at %s/health\n' "$API_BASE_URL" >&2
+    log "health retry ${n}/${SMOKE_HEALTH_RETRIES}"
+    if [[ "$n" -ge "$SMOKE_HEALTH_RETRIES" ]]; then
+      printf '[smoke] API not ready at %s/health (run uvicorn main:app --reload first)\n' "$API_BASE_URL" >&2
       exit 1
     fi
-    sleep 1
+    sleep "$SMOKE_HEALTH_INTERVAL"
   done
+  log "API health ready"
 }
 
 seed_data() {
