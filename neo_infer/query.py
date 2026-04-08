@@ -273,20 +273,20 @@ class QueryRepository:
 
     def compute_length2_rule_metrics(self, r1: str, r2: str, head_rel: str) -> dict[str, int]:
         query = """
-        CALL {
+        CALL () {
           MATCH (x)-[a]->(z)-[b]->(y)
           WHERE type(a) = $r1 AND type(b) = $r2
           MATCH (x)-[h]->(y)
           WHERE type(h) = $head_rel
           RETURN count(DISTINCT [x, y]) AS support
         }
-        CALL {
+        CALL () {
           MATCH (x)-[a]->(z)-[b]->(y)
           WHERE type(a) = $r1 AND type(b) = $r2
             AND EXISTS { MATCH (x)-[hh]->() WHERE type(hh) = $head_rel }
           RETURN count(DISTINCT [x, y]) AS pca_denominator
         }
-        CALL {
+        CALL () {
           MATCH ()-[h]->()
           WHERE type(h) = $head_rel
           RETURN count(h) AS head_count
@@ -305,20 +305,20 @@ class QueryRepository:
 
     def compute_length3_rule_metrics(self, r1: str, r2: str, r3: str, head_rel: str) -> dict[str, int]:
         query = """
-        CALL {
+        CALL () {
           MATCH (x)-[a]->(m1)-[b]->(m2)-[c]->(y)
           WHERE type(a) = $r1 AND type(b) = $r2 AND type(c) = $r3
           MATCH (x)-[h]->(y)
           WHERE type(h) = $head_rel
           RETURN count(DISTINCT [x, y]) AS support
         }
-        CALL {
+        CALL () {
           MATCH (x)-[a]->(m1)-[b]->(m2)-[c]->(y)
           WHERE type(a) = $r1 AND type(b) = $r2 AND type(c) = $r3
             AND EXISTS { MATCH (x)-[hh]->() WHERE type(hh) = $head_rel }
           RETURN count(DISTINCT [x, y]) AS pca_denominator
         }
-        CALL {
+        CALL () {
           MATCH ()-[h]->()
           WHERE type(h) = $head_rel
           RETURN count(h) AS head_count
