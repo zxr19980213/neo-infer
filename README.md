@@ -194,6 +194,19 @@ pytest -q
   - schema 脚本会为历史 `ChangeLog` 回填 `change_seq`
   - 同步初始化 `IdSequence{name:'ChangeLog'}.next_seq`
 
+## 一键本地回归脚本（smoke_local.sh）
+在本地 Neo4j 已部署前提下，可直接运行：
+
+```bash
+bash scripts/smoke_local.sh
+```
+
+可选参数：
+- `SMOKE_RESET_DB=1`：执行前清空图数据
+- `SMOKE_START_SERVER=1`：脚本内自动启动 `uvicorn`（默认 `0`，要求你已手工启动服务）
+- `SMOKE_APPLY_SCHEMA=1`：执行 schema/migration（默认开启）
+- `NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD / NEO4J_DATABASE`：Neo4j 连接配置
+
 ## API
 - `GET /health`
 - `POST /rules/mine`
