@@ -53,7 +53,7 @@ class IncrementalStore:
             WITH counter, $events AS events
             WITH counter, events, toInteger(counter.next_seq) AS start_seq
             UNWIND range(0, size(events) - 1) AS idx
-            WITH counter, events[idx] AS event, start_seq + idx AS seq, idx
+            WITH counter, start_seq, events[idx] AS event, start_seq + idx AS seq
             CREATE (c:ChangeLog {
               change_seq: seq,
               event_type: event.event_type,
