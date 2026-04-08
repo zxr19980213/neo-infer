@@ -266,6 +266,12 @@ python scripts/bench_index_strategies.py \
 - `POST /changes/append`
 - `POST /rules/mine/incremental/from-changelog`
 
+### 挖掘参数说明（关键）
+- `factual_only`（默认 `true`）：
+  - 当为 `true` 时，规则挖掘相关统计（body 候选、support、PCA 分母、head 计数）仅使用事实边（`is_inferred != true`）。
+  - 用于避免 benchmark 被历史推理边污染，建议保持默认值。
+  - 如需包含推理边参与统计，可显式传 `false`。
+
 ## 推理接口说明（增强）
 `POST /inference/run` 支持冲突检测字段：
 

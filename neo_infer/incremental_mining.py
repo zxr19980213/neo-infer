@@ -137,6 +137,7 @@ class IncrementalMiningService:
             min_head_coverage=request.min_head_coverage or 0.0,
             top_k=request.limit,
             candidate_limit=request.candidate_limit or max(request.limit * 20, 100),
+            factual_only=request.factual_only,
             beam_width=request.beam_width,
             head_budget_per_relation=request.head_budget_per_relation,
             confidence_ub_weight=request.confidence_ub_weight,

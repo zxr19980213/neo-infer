@@ -16,6 +16,7 @@ class MiningConfig:
     candidate_limit: int = 2000
     body_length: int = 2
     changed_relations: list[str] | None = None
+    factual_only: bool = True
     # AMIE+ search-space controls:
     # - beam_width: keep top-B body candidates per expansion level.
     # - head_budget_per_relation: keep at most K rules per head relation.
@@ -30,6 +31,18 @@ class RuleMiningService:
 
     def __init__(self, repository: QueryRepository) -> None:
         self._repository = repository
+
+    def _repo_call(self, method_name: str, /, **kwargs):
+        method = getattr(self._repository, method_name)
+        try:
+            return method(**kwargs)
+        except TypeError:
+            # Backward-compatible fallback for stub/legacy repos that don't accept new kwargs.
+            if "factual_only" in kwargs:
+                fallback = dict(kwargs)
+                fallback.pop("factual_only", None)
+                return method(**fallback)
+            raise
 
     def mine_rules(self, config: MiningConfig) -> list[Rule]:
         if config.body_length == 3:
@@ -188,10 +201,17 @@ class RuleMiningService:
         if not hasattr(self._repository, "relation_functionality"):
             return {}
         try:
-            data = self._repository.relation_functionality()
+            data = self._repo_call(
+                "relation_functionality",
+                factual_only=self._active_factual_only,
+            )
             return {str(k): float(v) for k, v in data.items()}
         except Exception:
             return {}
+
+    @property
+    def _active_factual_only(self) -> bool:
+        return bool(getattr(self, "_factual_only", True))
 
     def _sort_length2_bodies_by_functionality(
         self,
@@ -349,19 +369,24 @@ class RuleMiningService:
         return pruned
 
     def mine_length2_rules(self, config: MiningConfig) -> list[Rule]:
+        self._factual_only = bool(config.factual_only)
         # AMIE dangling step (len-2): enumerate body candidates first, then close to head.
-        bodies = self._repository.length2_body_candidates(
+        bodies = self._repo_call(
+            "length2_body_candidates",
             limit=config.candidate_limit,
             affected_relations=config.changed_relations,
+            factual_only=config.factual_only,
         )
         body_pairs, support_map = self._support_prune_length2_bodies(bodies, config.min_support)
         body_pairs = self._redundancy_prune_length2_bodies(body_pairs, support_map)
         body_pairs = self._sort_length2_bodies_by_functionality(body_pairs)
         body_pairs = self._apply_beam_budget_length2(body_pairs, support_map, config.beam_width)
         body_pairs = body_pairs[: config.candidate_limit]
-        raw_candidates = self._repository.length2_path_rule_candidates_for_bodies(
+        raw_candidates = self._repo_call(
+            "length2_path_rule_candidates_for_bodies",
             body_pairs=body_pairs,
             limit=config.candidate_limit,
+            factual_only=config.factual_only,
         )
         raw_candidates = self._dedup_by_signature(raw_candidates)
         raw_candidates = self._prune_low_confidence_upper_bound(
@@ -370,7 +395,10 @@ class RuleMiningService:
             config.confidence_ub_weight,
         )
         raw_candidates = self._apply_head_bucket_budget(raw_candidates, config.head_budget_per_relation)
-        head_counts = self._repository.head_relation_counts()
+        head_counts = self._repo_call(
+            "head_relation_counts",
+            factual_only=config.factual_only,
+        )
         return self._to_rules_from_candidates(raw_candidates, head_counts, config)
 
     def build_rules_from_relation_triples(
@@ -381,11 +409,20 @@ class RuleMiningService:
         if not triples:
             return []
 
-        head_counts = self._repository.head_relation_counts()
+        head_counts = self._repo_call(
+            "head_relation_counts",
+            factual_only=config.factual_only,
+        )
         rules: list[Rule] = []
         seen: set[str] = set()
         for r1, r2, head_rel in triples:
-            metrics = self._repository.compute_length2_rule_metrics(r1, r2, head_rel)
+            metrics = self._repo_call(
+                "compute_length2_rule_metrics",
+                r1,
+                r2,
+                head_rel,
+                factual_only=config.factual_only,
+            )
             support = int(metrics.get("support", 0))
             pca_denominator = int(metrics.get("pca_denominator", 0))
             pca_confidence = float(support) / float(pca_denominator) if pca_denominator > 0 else 0.0
@@ -423,22 +460,27 @@ class RuleMiningService:
         config: MiningConfig,
         affected_relations: list[str],
     ) -> list[Rule]:
+        self._factual_only = bool(config.factual_only)
         normalized = [normalize_relation_token(item) for item in affected_relations]
         normalized = [item for item in normalized if item]
         if not normalized:
             return []
-        bodies = self._repository.length2_body_candidates(
+        bodies = self._repo_call(
+            "length2_body_candidates",
             limit=config.candidate_limit,
             affected_relations=normalized,
+            factual_only=config.factual_only,
         )
         body_pairs, support_map = self._support_prune_length2_bodies(bodies, config.min_support)
         body_pairs = self._redundancy_prune_length2_bodies(body_pairs, support_map)
         body_pairs = self._sort_length2_bodies_by_functionality(body_pairs)
         body_pairs = self._apply_beam_budget_length2(body_pairs, support_map, config.beam_width)
         body_pairs = body_pairs[: config.candidate_limit]
-        raw_candidates = self._repository.length2_path_rule_candidates_for_bodies(
+        raw_candidates = self._repo_call(
+            "length2_path_rule_candidates_for_bodies",
             body_pairs=body_pairs,
             limit=config.candidate_limit,
+            factual_only=config.factual_only,
         )
         raw_candidates = self._dedup_by_signature(raw_candidates)
         raw_candidates = self._prune_low_confidence_upper_bound(
@@ -447,7 +489,10 @@ class RuleMiningService:
             config.confidence_ub_weight,
         )
         raw_candidates = self._apply_head_bucket_budget(raw_candidates, config.head_budget_per_relation)
-        head_counts = self._repository.head_relation_counts()
+        head_counts = self._repo_call(
+            "head_relation_counts",
+            factual_only=config.factual_only,
+        )
         return self._to_rules_from_candidates(raw_candidates, head_counts, config)
 
     def mine_length3_rules_incremental(
@@ -455,6 +500,7 @@ class RuleMiningService:
         config: MiningConfig,
         affected_relations: list[str],
     ) -> list[Rule]:
+        self._factual_only = bool(config.factual_only)
         normalized = [normalize_relation_token(item) for item in affected_relations]
         normalized = [item for item in normalized if item]
         if not normalized:
@@ -463,17 +509,21 @@ class RuleMiningService:
         # 1) mine length-2 prefix bodies under affected relations
         # 2) expand dangling third atom constrained by prefixes
         # 3) close to head relations
-        prefix_bodies = self._repository.length2_body_candidates(
+        prefix_bodies = self._repo_call(
+            "length2_body_candidates",
             limit=config.candidate_limit,
             affected_relations=normalized,
+            factual_only=config.factual_only,
         )
         prefixes, prefix_support_map = self._support_prune_length2_bodies(prefix_bodies, config.min_support)
         prefixes = self._redundancy_prune_length2_bodies(prefixes, prefix_support_map)
         prefixes = self._sort_length2_bodies_by_functionality(prefixes)[: config.candidate_limit]
-        len3_bodies = self._repository.length3_body_candidates(
+        len3_bodies = self._repo_call(
+            "length3_body_candidates",
             limit=config.candidate_limit,
             affected_relations=normalized,
             prefixes=prefixes,
+            factual_only=config.factual_only,
         )
         body_triples, triple_support_map = self._support_prune_length3_bodies(len3_bodies, config.min_support)
         body_triples = self._prune_non_improving_length3_bodies(
@@ -484,9 +534,11 @@ class RuleMiningService:
         body_triples = self._sort_length3_bodies_by_functionality(body_triples)
         body_triples = self._apply_beam_budget_length3(body_triples, triple_support_map, config.beam_width)
         body_triples = body_triples[: config.candidate_limit]
-        raw_candidates = self._repository.length3_path_rule_candidates_for_bodies(
+        raw_candidates = self._repo_call(
+            "length3_path_rule_candidates_for_bodies",
             body_triples=body_triples,
             limit=config.candidate_limit,
+            factual_only=config.factual_only,
         )
         raw_candidates = self._dedup_by_signature(raw_candidates)
         raw_candidates = self._prune_low_confidence_upper_bound(
@@ -495,25 +547,33 @@ class RuleMiningService:
             config.confidence_ub_weight,
         )
         raw_candidates = self._apply_head_bucket_budget(raw_candidates, config.head_budget_per_relation)
-        head_counts = self._repository.head_relation_counts()
+        head_counts = self._repo_call(
+            "head_relation_counts",
+            factual_only=config.factual_only,
+        )
         return self._to_rules_from_candidates(raw_candidates, head_counts, config)
 
     def mine_length3_rules(self, config: MiningConfig) -> list[Rule]:
+        self._factual_only = bool(config.factual_only)
         # AMIE dangling+closing (len-3 full):
         # 1) enumerate length-2 bodies
         # 2) dangle third body atom on top of prefixes
         # 3) close to head relations
-        prefix_bodies = self._repository.length2_body_candidates(
+        prefix_bodies = self._repo_call(
+            "length2_body_candidates",
             limit=config.candidate_limit,
             affected_relations=config.changed_relations,
+            factual_only=config.factual_only,
         )
         prefixes, prefix_support_map = self._support_prune_length2_bodies(prefix_bodies, config.min_support)
         prefixes = self._redundancy_prune_length2_bodies(prefixes, prefix_support_map)
         prefixes = self._sort_length2_bodies_by_functionality(prefixes)[: config.candidate_limit]
-        len3_bodies = self._repository.length3_body_candidates(
+        len3_bodies = self._repo_call(
+            "length3_body_candidates",
             limit=config.candidate_limit,
             affected_relations=config.changed_relations,
             prefixes=prefixes,
+            factual_only=config.factual_only,
         )
         body_triples, triple_support_map = self._support_prune_length3_bodies(len3_bodies, config.min_support)
         body_triples = self._prune_non_improving_length3_bodies(
@@ -524,9 +584,11 @@ class RuleMiningService:
         body_triples = self._sort_length3_bodies_by_functionality(body_triples)
         body_triples = self._apply_beam_budget_length3(body_triples, triple_support_map, config.beam_width)
         body_triples = body_triples[: config.candidate_limit]
-        raw_candidates = self._repository.length3_path_rule_candidates_for_bodies(
+        raw_candidates = self._repo_call(
+            "length3_path_rule_candidates_for_bodies",
             body_triples=body_triples,
             limit=config.candidate_limit,
+            factual_only=config.factual_only,
         )
         raw_candidates = self._dedup_by_signature(raw_candidates)
         raw_candidates = self._prune_low_confidence_upper_bound(
@@ -535,5 +597,8 @@ class RuleMiningService:
             config.confidence_ub_weight,
         )
         raw_candidates = self._apply_head_bucket_budget(raw_candidates, config.head_budget_per_relation)
-        head_counts = self._repository.head_relation_counts()
+        head_counts = self._repo_call(
+            "head_relation_counts",
+            factual_only=config.factual_only,
+        )
         return self._to_rules_from_candidates(raw_candidates, head_counts, config)

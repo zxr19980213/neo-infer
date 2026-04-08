@@ -54,12 +54,29 @@ def client_and_state(monkeypatch: pytest.MonkeyPatch):
                 return base + 1
             return base
 
-        def compute_length2_rule_metrics(self, r1: str, r2: str, head_rel: str) -> dict[str, int]:
+        def compute_length2_rule_metrics(
+            self,
+            r1: str,
+            r2: str,
+            head_rel: str,
+            *,
+            factual_only: bool = True,
+        ) -> dict[str, int]:
             _ = (r1, r2, head_rel)
+            _ = factual_only
             return {"support": 2, "pca_denominator": 2, "head_count": 2}
 
-        def compute_length3_rule_metrics(self, r1: str, r2: str, r3: str, head_rel: str) -> dict[str, int]:
+        def compute_length3_rule_metrics(
+            self,
+            r1: str,
+            r2: str,
+            r3: str,
+            head_rel: str,
+            *,
+            factual_only: bool = True,
+        ) -> dict[str, int]:
             _ = (r1, r2, r3, head_rel)
+            _ = factual_only
             return {"support": 1, "pca_denominator": 1, "head_count": 1}
 
     class FakeRuleMiningService:
