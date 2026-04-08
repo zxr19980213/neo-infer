@@ -25,7 +25,11 @@ def timed_post(
     path: str,
     payload: dict[str, object],
     name: str,
+    *,
+    verbose: bool = False,
 ) -> BenchResult:
+    if verbose:
+        print(f"[bench] POST {path} ...")
     start = time.perf_counter()
     resp = client.post(f"{base_url}{path}", json=payload)
     elapsed = time.perf_counter() - start
@@ -43,7 +47,10 @@ def timed_post(
                 extra["processed_changes"] = data["processed_changes"]
     except Exception:
         pass
-    return BenchResult(name=name, seconds=elapsed, status_code=resp.status_code, extra=extra)
+    result = BenchResult(name=name, seconds=elapsed, status_code=resp.status_code, extra=extra)
+    if verbose:
+        print(f"[bench] {name}: status={result.status_code} time={result.seconds:.3f}s extra={result.extra}")
+    return result
 
 
 def ensure_ok(result: BenchResult) -> None:
@@ -51,16 +58,25 @@ def ensure_ok(result: BenchResult) -> None:
         raise RuntimeError(f"{result.name} failed with HTTP {result.status_code}")
 
 
-def wait_health(client: httpx.Client, base_url: str, retries: int, interval: float) -> None:
+def wait_health(client: httpx.Client, base_url: str, retries: int, interval: float, *, verbose: bool = False) -> None:
     last_code: int | None = None
     for i in range(1, retries + 1):
         try:
-            health = client.get(f"{base_url}/health")
+            health = client.get(
+                f"{base_url}/health",
+                timeout=httpx.Timeout(connect=2.0, read=3.0, write=3.0, pool=3.0),
+            )
             last_code = health.status_code
             if health.status_code == 200:
+                if verbose:
+                    print(f"[bench] health ready after {i} tries")
                 return
+            if verbose:
+                print(f"[bench] health retry {i}/{retries}: HTTP {health.status_code}")
         except httpx.HTTPError:
             last_code = None
+            if verbose:
+                print(f"[bench] health retry {i}/{retries}: network error")
         time.sleep(interval)
     if last_code is None:
         raise RuntimeError(f"health check failed after {retries} retries (network error)")
@@ -79,6 +95,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", "--output-json", dest="out", default=os.getenv("BENCH_OUT", "bench_results.json"))
     parser.add_argument("--health-retries", type=int, default=int(os.getenv("BENCH_HEALTH_RETRIES", "30")))
     parser.add_argument("--health-interval", type=float, default=float(os.getenv("BENCH_HEALTH_INTERVAL", "1.0")))
+    parser.add_argument(
+        "--trust-env",
+        action="store_true",
+        default=os.getenv("BENCH_TRUST_ENV", "0") == "1",
+        help="Use HTTP_PROXY/HTTPS_PROXY from environment (default: off for local benchmarking).",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        default=True,
+        help="Print per-step progress logs.",
+    )
     parser.add_argument("--body-length", type=int, choices=[2, 3], default=int(os.getenv("BENCH_BODY_LENGTH", "2")))
     parser.add_argument("--mine-loops", type=int, default=int(os.getenv("BENCH_MINE_LOOPS", "1")))
     parser.add_argument("--infer-loops", type=int, default=int(os.getenv("BENCH_INFER_LOOPS", "1")))
@@ -129,8 +157,16 @@ def main() -> None:
     mine_times: list[float] = []
     infer_times: list[float] = []
     incr_times: list[float] = []
-    with httpx.Client(timeout=timeout) as client:
-        wait_health(client, base_url, retries=args.health_retries, interval=args.health_interval)
+    with httpx.Client(timeout=timeout, trust_env=args.trust_env) as client:
+        if args.verbose:
+            print(f"[bench] base_url={base_url} timeout={timeout}s trust_env={args.trust_env}")
+        wait_health(
+            client,
+            base_url,
+            retries=args.health_retries,
+            interval=args.health_interval,
+            verbose=args.verbose,
+        )
 
         mine_path = "/rules/mine" if args.body_length == 2 else "/rules/mine/length3"
         mine_candidate_limit = args.mine_candidate_limit if args.body_length == 2 else args.mine3_candidate_limit
@@ -147,6 +183,7 @@ def main() -> None:
                     "min_pca_confidence": args.min_pca,
                 },
                 f"mine_length{args.body_length}_loop{i + 1}",
+            verbose=args.verbose,
             )
             ensure_ok(mine_result)
             results.append(mine_result)
@@ -176,6 +213,7 @@ def main() -> None:
                     "check_conflicts": False,
                 },
                 f"inference_fixpoint_loop{i + 1}",
+            verbose=args.verbose,
             )
             ensure_ok(infer_result)
             results.append(infer_result)
@@ -208,6 +246,7 @@ def main() -> None:
                     "min_pca_confidence": 0.01,
                 },
                 "incremental_from_changelog_len2",
+            verbose=args.verbose,
             )
             ensure_ok(incr_result)
             results.append(incr_result)
