@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass
+from typing import Any
 
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -19,41 +20,31 @@ class Strategy:
     statements: list[str]
 
 
-def run_cypher(statement: str) -> None:
+def neo4j_conn() -> tuple[str, str, str, str]:
     uri = os.getenv("NEO4J_URI", "bolt://127.0.0.1:7687")
     user = os.getenv("NEO4J_USER", "neo4j")
     password = os.getenv("NEO4J_PASSWORD", "neo4j")
     database = os.getenv("NEO4J_DATABASE", "neo4j")
+    return uri, user, password, database
 
-    if shutil_which("cypher-shell"):
-        cmd = [
-            "cypher-shell",
-            "-a",
-            uri,
-            "-u",
-            user,
-            "-p",
-            password,
-            "-d",
-            database,
-            statement,
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            raise RuntimeError(f"cypher-shell failed: {proc.stderr.strip()}")
-        return
 
+def run_query(statement: str, parameters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    uri, user, password, database = neo4j_conn()
     try:
         from neo4j import GraphDatabase
     except Exception as exc:  # pragma: no cover
-        raise RuntimeError("neo4j driver is required when cypher-shell is unavailable") from exc
-
+        raise RuntimeError("neo4j python driver is required for index strategy benchmark") from exc
     driver = GraphDatabase.driver(uri, auth=(user, password))
     try:
         with driver.session(database=database) as session:
-            session.run(statement).consume()
+            result = session.run(statement, parameters or {})
+            return [row.data() for row in result]
     finally:
         driver.close()
+
+
+def run_cypher(statement: str) -> None:
+    _ = run_query(statement)
 
 
 def shutil_which(binary: str) -> str | None:
@@ -62,12 +53,62 @@ def shutil_which(binary: str) -> str | None:
     return which(binary)
 
 
-def apply_strategy(strategy: Strategy) -> None:
-    for stmt in strategy.statements:
+def drop_benchmark_indexes() -> None:
+    rows = run_query(
+        """
+        SHOW INDEXES YIELD name, entityType, labelsOrTypes, properties
+        WHERE entityType = 'NODE'
+        RETURN name, labelsOrTypes, properties
+        """
+    )
+    target = {
+        ("Rule", ("head_relation",)),
+        ("Rule", ("status",)),
+        ("ChangeLog", ("rel",)),
+        ("ChangeLog", ("event_type",)),
+        ("ConflictCase", ("rule_id",)),
+        ("ConflictCase", ("inferred_relation", "conflicting_relation")),
+    }
+    for row in rows:
+        labels = tuple(row.get("labelsOrTypes") or [])
+        props = tuple(row.get("properties") or [])
+        if len(labels) != 1:
+            continue
+        key = (labels[0], props)
+        if key in target:
+            run_cypher(f"DROP INDEX `{row['name']}` IF EXISTS")
+
+
+def reset_runtime_state() -> None:
+    # Keep base KG data, reset benchmark-generated state for fair strategy comparison.
+    statements = [
+        "MATCH ()-[r]->() WHERE coalesce(r.is_inferred, false) = true DELETE r",
+        "MATCH (n:Rule) DETACH DELETE n",
+        "MATCH (n:RuleStat) DETACH DELETE n",
+        "MATCH (n:RelationType) DETACH DELETE n",
+        "MATCH (n:ConflictCase) DETACH DELETE n",
+        "MATCH (n:ConflictRule) DETACH DELETE n",
+        "MATCH (n:ChangeLog) DETACH DELETE n",
+        "MATCH (n:IncrementalState) DETACH DELETE n",
+        "MERGE (s:IdSequence {name: 'ChangeLog'}) SET s.next_seq = 1",
+    ]
+    for stmt in statements:
         run_cypher(stmt)
 
 
+def apply_strategy(strategy: Strategy) -> None:
+    drop_benchmark_indexes()
+    reset_runtime_state()
+    for stmt in strategy.statements:
+        run_cypher(stmt)
+    try:
+        run_cypher("CALL db.awaitIndexes(120)")
+    except Exception:
+        pass
+
+
 def run_benchmark(
+    strategy_name: str,
     *,
     api_base_url: str,
     body_length: int,
@@ -83,12 +124,42 @@ def run_benchmark(
         os.path.join(ROOT_DIR, "scripts", "bench_api_perf.py"),
         "--base-url",
         api_base_url,
+        "--body-length",
+        str(body_length),
+        "--mine-loops",
+        str(mine_loops),
+        "--infer-loops",
+        str(infer_loops),
+        "--top-k",
+        str(top_k),
+        "--min-support",
+        str(min_support),
+        "--min-pca",
+        str(min_pca),
         "--out",
         output_json,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip())
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    stdout_lines: list[str] = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.rstrip("\n")
+        if line:
+            print(f"[index-bench:{strategy_name}] {line}")
+            stdout_lines.append(line)
+    stderr_text = ""
+    if proc.stderr is not None:
+        stderr_text = proc.stderr.read().strip()
+    return_code = proc.wait()
+    if return_code != 0:
+        msg = stderr_text or "\n".join(stdout_lines)
+        raise RuntimeError(msg)
     with open(output_json, "r", encoding="utf-8") as fh:
         return json.load(fh)
 
@@ -151,6 +222,7 @@ def main() -> None:
         apply_strategy(strategy)
         out_path = os.path.join(ROOT_DIR, f"bench_{strategy.name}.json")
         perf = run_benchmark(
+            strategy.name,
             api_base_url=args.api_base_url,
             body_length=args.body_length,
             mine_loops=args.mine_loops,
