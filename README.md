@@ -42,6 +42,125 @@ pip install -e .
 uvicorn main:app --reload
 ```
 
+## 本地 Neo4j 完整测试流程（不含 Docker）
+以下流程假设你已在本地启动并可访问 Neo4j。
+
+### 1) 准备测试数据（可选但推荐）
+```bash
+cypher-shell -a bolt://127.0.0.1:7687 -u neo4j -p neo4j '
+MATCH (n) DETACH DELETE n;
+CREATE (alice:Entity {id:"alice"}), (bob:Entity {id:"bob"}),
+       (beijing:Entity {id:"beijing"}), (shanghai:Entity {id:"shanghai"}),
+       (china:Entity {id:"china"}), (asia:Entity {id:"asia"});
+CREATE (alice)-[:bornIn]->(beijing),
+       (bob)-[:bornIn]->(shanghai),
+       (beijing)-[:locatedIn]->(china),
+       (shanghai)-[:locatedIn]->(china),
+       (china)-[:partOf]->(asia),
+       (alice)-[:nationality]->(china),
+       (alice)-[:region]->(asia),
+       (bob)-[:noNationality]->(china);'
+```
+
+### 2) 设置环境并启动服务
+```bash
+export NEO4J_URI="bolt://127.0.0.1:7687"
+export NEO4J_USER="neo4j"
+export NEO4J_PASSWORD="neo4j"
+export NEO4J_DATABASE="neo4j"
+pip install -e ".[dev]"
+uvicorn main:app --reload
+```
+
+### 3) 健康检查
+```bash
+curl "http://127.0.0.1:8000/health"
+```
+
+### 4) 规则挖掘（length2 + length3）
+```bash
+curl -X POST "http://127.0.0.1:8000/rules/mine" \
+  -H "Content-Type: application/json" \
+  -d '{"body_length":2,"limit":100,"min_support":1,"min_pca_confidence":0.1}'
+
+curl -X POST "http://127.0.0.1:8000/rules/mine/length3" \
+  -H "Content-Type: application/json" \
+  -d '{"body_length":3,"limit":100,"min_support":1,"min_pca_confidence":0.1}'
+```
+
+### 5) 采纳规则并执行推理
+先查看规则并复制一个 `rule_id`：
+```bash
+curl "http://127.0.0.1:8000/rules?status=discovered&limit=100"
+```
+
+采纳并推理（示例把 `<RULE_ID>` 替换为真实值）：
+```bash
+curl -X POST "http://127.0.0.1:8000/rules/<RULE_ID>/adopt"
+
+curl -X POST "http://127.0.0.1:8000/inference/run" \
+  -H "Content-Type: application/json" \
+  -d '{"limit_rules":100,"fixpoint":false,"max_iterations":5,"check_conflicts":false}'
+```
+
+### 6) 冲突链路验证（含冲突实例）
+```bash
+curl -X PUT "http://127.0.0.1:8000/conflicts" \
+  -H "Content-Type: application/json" \
+  -d '{"pairs":{"nationality":["noNationality"]}}'
+
+curl -X POST "http://127.0.0.1:8000/inference/run" \
+  -H "Content-Type: application/json" \
+  -d '{"limit_rules":100,"fixpoint":false,"check_conflicts":true}'
+
+curl "http://127.0.0.1:8000/conflicts/cases?limit=50"
+curl "http://127.0.0.1:8000/conflict-cases?limit=50"
+```
+
+### 7) 增量挖掘链路验证（from-changelog）
+追加变更：
+```bash
+curl -X POST "http://127.0.0.1:8000/changes/append" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "added_edges":[
+      {"src":"u1","rel":"bornIn","dst":"u2"},
+      {"src":"u2","rel":"locatedIn","dst":"u3"}
+    ],
+    "removed_edges":[]
+  }'
+```
+
+首次消费（非空 delta）：
+```bash
+curl -X POST "http://127.0.0.1:8000/rules/mine/incremental/from-changelog" \
+  -H "Content-Type: application/json" \
+  -d '{"limit":100,"min_support":1,"min_pca_confidence":0.1,"body_length":2}'
+```
+
+再次消费（幂等，期望 `processed_changes=0`）：
+```bash
+curl -X POST "http://127.0.0.1:8000/rules/mine/incremental/from-changelog" \
+  -H "Content-Type: application/json" \
+  -d '{"limit":100,"min_support":1,"min_pca_confidence":0.1,"body_length":2}'
+```
+
+混合 add/remove：
+```bash
+curl -X POST "http://127.0.0.1:8000/changes/append" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "added_edges":[{"src":"u10","rel":"bornIn","dst":"u20"}],
+    "removed_edges":[{"src":"u2","rel":"locatedIn","dst":"u3"}]
+  }'
+```
+
+```bash
+curl -X POST "http://127.0.0.1:8000/rules/mine/incremental/from-changelog" \
+  -H "Content-Type: application/json" \
+  -d '{"limit":100,"min_support":1,"min_pca_confidence":0.1,"body_length":2}'
+```
+
 ## 自动化稳定性测试（Smoke）
 新增了 API 全链路 smoke tests，覆盖：
 - `rules mine`（长度2/长度3/增量）
@@ -115,14 +234,14 @@ pytest -q
   - `rule_id`
   - `inferred_relation`
   - `conflicting_relation`
-  - `x_name / y_name`
-  - `detected_at`
+  - `source_x / source_y`
+  - `first_iteration / last_iteration / detect_count`
 
 ## 规则挖掘请求示例（长度2/3 + 增量）
 ```json
 {
   "limit": 200,
-  "rule_length": 3,
+  "body_length": 3,
   "min_support": 1,
   "min_pca_confidence": 0.2,
   "candidate_limit": 5000,
@@ -130,7 +249,7 @@ pytest -q
 }
 ```
 
-- `rule_length`: `2` 或 `3`
+- `body_length`: `2` 或 `3`
 - `affected_relations`: 可选，增量重算入口；仅挖掘 body/head 涉及这些关系的候选规则
 
 ## 真增量挖掘（ChangeLog 驱动）
