@@ -11,6 +11,7 @@ set -euo pipefail
 #   SMOKE_RESET_DB      default: 0   (set 1 to clear graph first)
 #   SMOKE_INIT_DATA     default: 1   (set 0 to skip seed data)
 #   SMOKE_APPLY_SCHEMA  default: 1   (set 0 to skip schema bootstrap script)
+#   SMOKE_SCHEMA_STRICT default: 0   (set 1 to fail when schema apply fails)
 #   SMOKE_HEALTH_RETRIES default: 20
 #   SMOKE_HEALTH_INTERVAL default: 1
 #   SMOKE_CURL_TIMEOUT  default: 3
@@ -23,6 +24,7 @@ NEO4J_DATABASE="${NEO4J_DATABASE:-neo4j}"
 SMOKE_RESET_DB="${SMOKE_RESET_DB:-0}"
 SMOKE_INIT_DATA="${SMOKE_INIT_DATA:-1}"
 SMOKE_APPLY_SCHEMA="${SMOKE_APPLY_SCHEMA:-1}"
+SMOKE_SCHEMA_STRICT="${SMOKE_SCHEMA_STRICT:-0}"
 SMOKE_HEALTH_RETRIES="${SMOKE_HEALTH_RETRIES:-20}"
 SMOKE_HEALTH_INTERVAL="${SMOKE_HEALTH_INTERVAL:-1}"
 SMOKE_CURL_TIMEOUT="${SMOKE_CURL_TIMEOUT:-3}"
@@ -40,6 +42,19 @@ require_cmd() {
   fi
 }
 
+detect_python() {
+  if command -v python3 >/dev/null 2>&1; then
+    echo "python3"
+    return
+  fi
+  if command -v python >/dev/null 2>&1; then
+    echo "python"
+    return
+  fi
+  printf '[smoke] missing python runtime (python3/python)\n' >&2
+  exit 1
+}
+
 run_cypher() {
   local query="$1"
   if command -v cypher-shell >/dev/null 2>&1; then
@@ -50,7 +65,7 @@ run_cypher() {
     NEO4J_USER="$NEO4J_USER" \
     NEO4J_PASSWORD="$NEO4J_PASSWORD" \
     NEO4J_DATABASE="$NEO4J_DATABASE" \
-    python3 - <<'PY'
+    "$PYTHON_BIN" - <<'PY'
 import os
 from neo4j import GraphDatabase
 
@@ -185,14 +200,20 @@ MERGE (bob)-[:noNationality]->(china);
 
 main() {
   require_cmd curl
-  require_cmd python3
+  PYTHON_BIN="$(detect_python)"
 
   log "workspace: ${ROOT_DIR}"
   wait_health
 
   if [[ "$SMOKE_APPLY_SCHEMA" == "1" ]]; then
     log "apply schema script"
-    (cd "$ROOT_DIR" && python3 scripts/apply_neo4j_schema.py >/dev/null)
+    if ! (cd "$ROOT_DIR" && "$PYTHON_BIN" scripts/apply_neo4j_schema.py); then
+      if [[ "$SMOKE_SCHEMA_STRICT" == "1" ]]; then
+        printf '[smoke] schema apply failed and SMOKE_SCHEMA_STRICT=1\n' >&2
+        exit 1
+      fi
+      log "schema apply failed, continue (set SMOKE_SCHEMA_STRICT=1 to fail fast)"
+    fi
   fi
 
   if [[ "$SMOKE_INIT_DATA" == "1" ]]; then
