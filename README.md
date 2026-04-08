@@ -197,21 +197,28 @@ python scripts/bench_seed_large.py \
 ```bash
 python scripts/bench_api_perf.py \
   --api-base-url http://127.0.0.1:8000 \
-  --runs 3 \
-  --mine-limit 1000 \
-  --inference-limit-rules 500
+  --health-retries 60 \
+  --health-interval 2 \
+  --body-length 2 \
+  --mine-loops 3 \
+  --infer-loops 3 \
+  --top-k 1000 \
+  --infer-limit-rules 500 \
+  --output-json bench_api_perf.json
 ```
 
 输出：
-- 每个端点的 p50/p95/max 耗时
-- 成功率与失败样本
-- JSON 结果可落盘用于对比（`--output-json`）
+- 挖掘/推理/增量三段的 `mean/p95/max` 耗时
+- 每次请求的状态码与关键计数（rule 数、processed_changes 等）
+- JSON 结果可落盘用于对比（`--output-json` / `--out`）
 
 ### 3) 索引策略自动对比
 ```bash
 python scripts/bench_index_strategies.py \
   --api-base-url http://127.0.0.1:8000 \
-  --runs 2 \
+  --body-length 2 \
+  --mine-loops 3 \
+  --infer-loops 3 \
   --output-json bench_index_compare.json
 ```
 

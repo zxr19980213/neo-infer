@@ -81,21 +81,9 @@ def run_benchmark(
     cmd = [
         PYTHON_BIN,
         os.path.join(ROOT_DIR, "scripts", "bench_api_perf.py"),
-        "--api-base-url",
+        "--base-url",
         api_base_url,
-        "--body-length",
-        str(body_length),
-        "--mine-loops",
-        str(mine_loops),
-        "--infer-loops",
-        str(infer_loops),
-        "--top-k",
-        str(top_k),
-        "--min-support",
-        str(min_support),
-        "--min-pca",
-        str(min_pca),
-        "--output-json",
+        "--out",
         output_json,
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
