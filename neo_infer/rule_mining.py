@@ -18,7 +18,7 @@ class MiningConfig:
 
 
 class RuleMiningService:
-    """MVP 挖掘器：r1(X,Z) ∧ r2(Z,Y) -> r3(X,Y)。"""
+    """AMIE+-style miner with dangling/closing search skeleton."""
 
     def __init__(self, repository: QueryRepository) -> None:
         self._repository = repository
@@ -65,7 +65,16 @@ class RuleMiningService:
         return rules[: config.top_k]
 
     def mine_length2_rules(self, config: MiningConfig) -> list[Rule]:
-        raw_candidates = self._repository.length2_path_rule_candidates(limit=config.candidate_limit)
+        # AMIE dangling step (len-2): enumerate body candidates first, then close to head.
+        bodies = self._repository.length2_body_candidates(
+            limit=config.candidate_limit,
+            affected_relations=config.changed_relations,
+        )
+        body_pairs = [(r1, r2) for r1, r2, body_support in bodies if body_support >= config.min_support]
+        raw_candidates = self._repository.length2_path_rule_candidates_for_bodies(
+            body_pairs=body_pairs,
+            limit=config.candidate_limit,
+        )
         head_counts = self._repository.head_relation_counts()
         return self._to_rules_from_candidates(raw_candidates, head_counts, config)
 
@@ -123,6 +132,7 @@ class RuleMiningService:
         normalized = [item for item in normalized if item]
         if not normalized:
             return []
+        # Keep same path but force relation filter for impacted relations only.
         raw_candidates = self._repository.length2_path_rule_candidates_incremental(
             limit=config.candidate_limit,
             affected_relations=normalized,
@@ -139,14 +149,55 @@ class RuleMiningService:
         normalized = [item for item in normalized if item]
         if not normalized:
             return []
-        raw_candidates = self._repository.length3_path_rule_candidates_incremental(
+        # AMIE dangling+closing (len-3 incremental):
+        # 1) mine length-2 prefix bodies under affected relations
+        # 2) expand dangling third atom constrained by prefixes
+        # 3) close to head relations
+        prefix_bodies = self._repository.length2_body_candidates(
             limit=config.candidate_limit,
             affected_relations=normalized,
+        )
+        prefixes = [(r1, r2) for r1, r2, body_support in prefix_bodies if body_support >= config.min_support]
+        len3_bodies = self._repository.length3_body_candidates(
+            limit=config.candidate_limit,
+            affected_relations=normalized,
+            prefixes=prefixes,
+        )
+        body_triples = [
+            (r1, r2, r3)
+            for r1, r2, r3, body_support in len3_bodies
+            if body_support >= config.min_support
+        ]
+        raw_candidates = self._repository.length3_path_rule_candidates_for_bodies(
+            body_triples=body_triples,
+            limit=config.candidate_limit,
         )
         head_counts = self._repository.head_relation_counts()
         return self._to_rules_from_candidates(raw_candidates, head_counts, config)
 
     def mine_length3_rules(self, config: MiningConfig) -> list[Rule]:
-        raw_candidates = self._repository.length3_path_rule_candidates(limit=config.candidate_limit)
+        # AMIE dangling+closing (len-3 full):
+        # 1) enumerate length-2 bodies
+        # 2) dangle third body atom on top of prefixes
+        # 3) close to head relations
+        prefix_bodies = self._repository.length2_body_candidates(
+            limit=config.candidate_limit,
+            affected_relations=config.changed_relations,
+        )
+        prefixes = [(r1, r2) for r1, r2, body_support in prefix_bodies if body_support >= config.min_support]
+        len3_bodies = self._repository.length3_body_candidates(
+            limit=config.candidate_limit,
+            affected_relations=config.changed_relations,
+            prefixes=prefixes,
+        )
+        body_triples = [
+            (r1, r2, r3)
+            for r1, r2, r3, body_support in len3_bodies
+            if body_support >= config.min_support
+        ]
+        raw_candidates = self._repository.length3_path_rule_candidates_for_bodies(
+            body_triples=body_triples,
+            limit=config.candidate_limit,
+        )
         head_counts = self._repository.head_relation_counts()
         return self._to_rules_from_candidates(raw_candidates, head_counts, config)

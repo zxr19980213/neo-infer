@@ -130,37 +130,9 @@ class QueryRepository:
         return denominator_cache
 
     def length2_path_rule_candidates(self, limit: int = 5000) -> list[PathRuleCandidate]:
-        # 规则模板：r1(X,Z) ∧ r2(Z,Y) -> r3(X,Y)
-        # support: 同时满足 body 与 head 的 (X, Y) 去重数量
-        # pca_denominator: 满足 body 且 X 存在任意 r3 出边的 (X, Y) 去重数量
-        phase1_query = """
-        MATCH (x)-[a]->(z)-[b]->(y)
-        WITH type(a) AS r1, type(b) AS r2, x, y
-        MATCH (x)-[h]->(y)
-        WITH r1, r2, type(h) AS r3, collect(DISTINCT [x, y]) AS pairs
-        RETURN r1, r2, r3, size(pairs) AS support
-        ORDER BY support DESC
-        LIMIT $limit
-        """
-
-        with self._driver.session(database=self._database) as session:
-            phase1_records = list(session.run(phase1_query, {"limit": limit}))
-            denominator_cache = self._batch_length2_pca_denominators(session, phase1_records)
-            candidates: list[PathRuleCandidate] = []
-            for record in phase1_records:
-                r1 = str(record["r1"])
-                r2 = str(record["r2"])
-                r3 = str(record["r3"])
-                support = int(record["support"])
-                candidates.append(
-                    PathRuleCandidate(
-                        body_relations=(r1, r2),
-                        head_relation=r3,
-                        support=support,
-                        pca_denominator=denominator_cache.get((r1, r2, r3), 0),
-                    )
-                )
-            return candidates
+        bodies = self.length2_body_candidates(limit=limit, affected_relations=None)
+        body_pairs = [(r1, r2) for r1, r2, _ in bodies]
+        return self.length2_path_rule_candidates_for_bodies(body_pairs=body_pairs, limit=limit)
 
     def length2_path_rule_candidates_incremental(
         self,
@@ -168,69 +140,14 @@ class QueryRepository:
         affected_relations: list[str],
     ) -> list[PathRuleCandidate]:
         touched = [rel.strip().replace("`", "") for rel in affected_relations if rel.strip()]
-        if not touched:
-            return []
-
-        phase1_query = """
-        MATCH (x)-[a]->(z)-[b]->(y)
-        WITH type(a) AS r1, type(b) AS r2, x, y
-        MATCH (x)-[h]->(y)
-        WITH r1, r2, type(h) AS r3, collect(DISTINCT [x, y]) AS pairs
-        WHERE r1 IN $rels OR r2 IN $rels OR r3 IN $rels
-        RETURN r1, r2, r3, size(pairs) AS support
-        ORDER BY support DESC
-        LIMIT $limit
-        """
-
-        with self._driver.session(database=self._database) as session:
-            phase1_records = list(session.run(phase1_query, {"limit": limit, "rels": touched}))
-            denominator_cache = self._batch_length2_pca_denominators(session, phase1_records)
-            candidates: list[PathRuleCandidate] = []
-            for record in phase1_records:
-                r1 = str(record["r1"])
-                r2 = str(record["r2"])
-                r3 = str(record["r3"])
-                support = int(record["support"])
-                candidates.append(
-                    PathRuleCandidate(
-                        body_relations=(r1, r2),
-                        head_relation=r3,
-                        support=support,
-                        pca_denominator=denominator_cache.get((r1, r2, r3), 0),
-                    )
-                )
-            return candidates
+        bodies = self.length2_body_candidates(limit=limit, affected_relations=touched)
+        body_pairs = [(r1, r2) for r1, r2, _ in bodies]
+        return self.length2_path_rule_candidates_for_bodies(body_pairs=body_pairs, limit=limit)
 
     def length3_path_rule_candidates(self, limit: int = 5000) -> list[PathRuleCandidate]:
-        # 规则模板：r1(X,A) ∧ r2(A,B) ∧ r3(B,Y) -> h(X,Y)
-        phase1_query = """
-        MATCH (x)-[a]->(m1)-[b]->(m2)-[c]->(y)
-        WITH type(a) AS r1, type(b) AS r2, type(c) AS r3, x, y
-        MATCH (x)-[h]->(y)
-        WITH r1, r2, r3, type(h) AS head, collect(DISTINCT [x, y]) AS pairs
-        RETURN r1, r2, r3, head, size(pairs) AS support
-        ORDER BY support DESC
-        LIMIT $limit
-        """
-        with self._driver.session(database=self._database) as session:
-            phase1_records = list(session.run(phase1_query, {"limit": limit}))
-            denominator_cache = self._batch_length3_pca_denominators(session, phase1_records)
-            candidates: list[PathRuleCandidate] = []
-            for record in phase1_records:
-                r1 = str(record["r1"])
-                r2 = str(record["r2"])
-                r3 = str(record["r3"])
-                head = str(record["head"])
-                support = int(record["support"])
-                candidates.append(
-                    PathRuleCandidate(
-                        body_relations=(r1, r2, r3),
-                        head_relation=head,
-                        support=support,
-                        pca_denominator=denominator_cache.get((r1, r2, r3, head), 0),
-                    )
-                )
-            return candidates
+        bodies = self.length3_body_candidates(limit=limit, affected_relations=None, prefixes=None)
+        body_triples = [(r1, r2, r3) for r1, r2, r3, _ in bodies]
+        return self.length3_path_rule_candidates_for_bodies(body_triples=body_triples, limit=limit)
 
     def length3_path_rule_candidates_incremental(
         self,
@@ -238,38 +155,131 @@ class QueryRepository:
         affected_relations: list[str],
     ) -> list[PathRuleCandidate]:
         touched = [rel.strip().replace("`", "") for rel in affected_relations if rel.strip()]
-        if not touched:
-            return []
+        bodies = self.length3_body_candidates(limit=limit, affected_relations=touched, prefixes=None)
+        body_triples = [(r1, r2, r3) for r1, r2, r3, _ in bodies]
+        return self.length3_path_rule_candidates_for_bodies(body_triples=body_triples, limit=limit)
 
-        phase1_query = """
+    def length2_body_candidates(
+        self,
+        limit: int = 5000,
+        affected_relations: list[str] | None = None,
+    ) -> list[tuple[str, str, int]]:
+        rels = [item.strip().replace("`", "") for item in (affected_relations or []) if item.strip()]
+        query = """
+        MATCH (x)-[a]->(z)-[b]->(y)
+        WITH type(a) AS r1, type(b) AS r2, collect(DISTINCT [x, y]) AS pairs
+        WHERE size($rels) = 0 OR r1 IN $rels OR r2 IN $rels
+        RETURN r1, r2, size(pairs) AS body_support
+        ORDER BY body_support DESC
+        LIMIT $limit
+        """
+        with self._driver.session(database=self._database) as session:
+            rows = list(session.run(query, {"rels": rels, "limit": int(limit)}))
+            return [(str(row["r1"]), str(row["r2"]), int(row["body_support"])) for row in rows]
+
+    def length3_body_candidates(
+        self,
+        limit: int = 5000,
+        affected_relations: list[str] | None = None,
+        prefixes: list[tuple[str, str]] | None = None,
+    ) -> list[tuple[str, str, str, int]]:
+        rels = [item.strip().replace("`", "") for item in (affected_relations or []) if item.strip()]
+        prefix_payload = [{"r1": r1, "r2": r2} for r1, r2 in (prefixes or [])]
+        query = """
         MATCH (x)-[a]->(m1)-[b]->(m2)-[c]->(y)
-        WITH type(a) AS r1, type(b) AS r2, type(c) AS r3, x, y
+        WITH type(a) AS r1, type(b) AS r2, type(c) AS r3, collect(DISTINCT [x, y]) AS pairs
+        WHERE (size($rels) = 0 OR r1 IN $rels OR r2 IN $rels OR r3 IN $rels)
+          AND (size($prefixes) = 0 OR any(p IN $prefixes WHERE p.r1 = r1 AND p.r2 = r2))
+        RETURN r1, r2, r3, size(pairs) AS body_support
+        ORDER BY body_support DESC
+        LIMIT $limit
+        """
+        with self._driver.session(database=self._database) as session:
+            rows = list(
+                session.run(
+                    query,
+                    {"rels": rels, "prefixes": prefix_payload, "limit": int(limit)},
+                )
+            )
+            return [
+                (str(row["r1"]), str(row["r2"]), str(row["r3"]), int(row["body_support"]))
+                for row in rows
+            ]
+
+    def length2_path_rule_candidates_for_bodies(
+        self,
+        body_pairs: list[tuple[str, str]],
+        limit: int = 5000,
+    ) -> list[PathRuleCandidate]:
+        if not body_pairs:
+            return []
+        query = """
+        UNWIND $pairs AS pair
+        MATCH (x)-[a]->(z)-[b]->(y)
+        WHERE type(a) = pair.r1 AND type(b) = pair.r2
+        WITH pair.r1 AS r1, pair.r2 AS r2, x, y
+        MATCH (x)-[h]->(y)
+        WITH r1, r2, type(h) AS r3, collect(DISTINCT [x, y]) AS pairs
+        RETURN r1, r2, r3, size(pairs) AS support
+        ORDER BY support DESC
+        LIMIT $limit
+        """
+        payload = [{"r1": r1, "r2": r2} for r1, r2 in body_pairs]
+        with self._driver.session(database=self._database) as session:
+            phase1_records = list(session.run(query, {"pairs": payload, "limit": int(limit)}))
+            denominator_cache = self._batch_length2_pca_denominators(session, phase1_records)
+            return [
+                PathRuleCandidate(
+                    body_relations=(str(record["r1"]), str(record["r2"])),
+                    head_relation=str(record["r3"]),
+                    support=int(record["support"]),
+                    pca_denominator=denominator_cache.get(
+                        (str(record["r1"]), str(record["r2"]), str(record["r3"])),
+                        0,
+                    ),
+                )
+                for record in phase1_records
+            ]
+
+    def length3_path_rule_candidates_for_bodies(
+        self,
+        body_triples: list[tuple[str, str, str]],
+        limit: int = 5000,
+    ) -> list[PathRuleCandidate]:
+        if not body_triples:
+            return []
+        query = """
+        UNWIND $triples AS tri
+        MATCH (x)-[a]->(m1)-[b]->(m2)-[c]->(y)
+        WHERE type(a) = tri.r1 AND type(b) = tri.r2 AND type(c) = tri.r3
+        WITH tri.r1 AS r1, tri.r2 AS r2, tri.r3 AS r3, x, y
         MATCH (x)-[h]->(y)
         WITH r1, r2, r3, type(h) AS head, collect(DISTINCT [x, y]) AS pairs
-        WHERE r1 IN $rels OR r2 IN $rels OR r3 IN $rels OR head IN $rels
         RETURN r1, r2, r3, head, size(pairs) AS support
         ORDER BY support DESC
         LIMIT $limit
         """
+        payload = [{"r1": r1, "r2": r2, "r3": r3} for r1, r2, r3 in body_triples]
         with self._driver.session(database=self._database) as session:
-            phase1_records = list(session.run(phase1_query, {"limit": limit, "rels": touched}))
+            phase1_records = list(session.run(query, {"triples": payload, "limit": int(limit)}))
             denominator_cache = self._batch_length3_pca_denominators(session, phase1_records)
-            candidates: list[PathRuleCandidate] = []
-            for record in phase1_records:
-                r1 = str(record["r1"])
-                r2 = str(record["r2"])
-                r3 = str(record["r3"])
-                head = str(record["head"])
-                support = int(record["support"])
-                candidates.append(
-                    PathRuleCandidate(
-                        body_relations=(r1, r2, r3),
-                        head_relation=head,
-                        support=support,
-                        pca_denominator=denominator_cache.get((r1, r2, r3, head), 0),
-                    )
+            return [
+                PathRuleCandidate(
+                    body_relations=(str(record["r1"]), str(record["r2"]), str(record["r3"])),
+                    head_relation=str(record["head"]),
+                    support=int(record["support"]),
+                    pca_denominator=denominator_cache.get(
+                        (
+                            str(record["r1"]),
+                            str(record["r2"]),
+                            str(record["r3"]),
+                            str(record["head"]),
+                        ),
+                        0,
+                    ),
                 )
-            return candidates
+                for record in phase1_records
+            ]
 
     def compute_length2_rule_metrics(self, r1: str, r2: str, head_rel: str) -> dict[str, int]:
         query = """
