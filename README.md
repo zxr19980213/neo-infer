@@ -173,6 +173,56 @@ pip install pytest
 pytest -q
 ```
 
+## 大批量性能压测与索引策略迭代
+以下脚本用于你本地 Neo4j 场景下的性能实验（不依赖 Docker）。
+
+### 1) 生成大规模基准数据
+```bash
+python scripts/bench_seed_large.py \
+  --reset \
+  --entities 50000 \
+  --countries 500 \
+  --regions 50 \
+  --batch-size 5000
+```
+
+说明：
+- 脚本会构造可用于规则挖掘/推理的结构化图（`bornIn/locatedIn/partOf/nationality/region/noNationality`）。
+- 可通过 `--noise-factor` 增加噪声边密度。
+
+### 2) 执行挖掘/推理基准
+确保 API 已启动后执行：
+```bash
+python scripts/bench_api_perf.py \
+  --api-base-url http://127.0.0.1:8000 \
+  --runs 3 \
+  --mine-limit 1000 \
+  --inference-limit-rules 500
+```
+
+输出：
+- 每个端点的 p50/p95/max 耗时
+- 成功率与失败样本
+- JSON 结果可落盘用于对比（`--output-json`）
+
+### 3) 索引策略自动对比
+```bash
+python scripts/bench_index_strategies.py \
+  --api-base-url http://127.0.0.1:8000 \
+  --runs 2 \
+  --output-json bench_index_compare.json
+```
+
+内置策略：
+- `baseline`: 仅核心唯一约束
+- `lean`: baseline + 常用单列索引
+- `aggressive`: lean + 额外复合/高频查询索引
+
+脚本会对每个策略：
+1) 应用索引集  
+2) 执行同一批压测请求  
+3) 汇总并输出对比结果（便于迭代选择）
+
 ## Neo4j Schema（索引/约束）与迁移
 - 应用启动时会自动执行 schema bootstrap（幂等）：
   - `Rule.rule_id` 唯一约束
