@@ -180,15 +180,17 @@ pytest -q
 ```bash
 python scripts/bench_seed_large.py \
   --reset \
-  --entities 50000 \
-  --countries 500 \
-  --regions 50 \
+  --num-person 200000 \
+  --num-city 5000 \
+  --num-country 500 \
+  --num-region 200 \
   --batch-size 5000
 ```
 
 说明：
-- 脚本会构造可用于规则挖掘/推理的结构化图（`bornIn/locatedIn/partOf/nationality/region/noNationality`）。
-- 可通过 `--noise-factor` 增加噪声边密度。
+- 脚本会构造可用于规则挖掘/推理的结构化图（`bornIn/locatedIn/partOf/nationality/noNationality/worksAt/educatedAt/livesIn/headquartersIn`）。
+- 若遇到认证失败，可显式传参：
+  - `--uri bolt://127.0.0.1:7687 --user neo4j --password <你的密码> --database neo4j`
 
 ### 2) 执行挖掘/推理基准
 确保 API 已启动后执行：

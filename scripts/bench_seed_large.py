@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import os
 import random
 from collections import defaultdict
 
 from neo4j import GraphDatabase
+from neo4j.exceptions import AuthError
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Seed large synthetic KG for performance benchmarking.")
-    parser.add_argument("--uri", default="bolt://127.0.0.1:7687")
-    parser.add_argument("--user", default="neo4j")
-    parser.add_argument("--password", default="neo4j")
-    parser.add_argument("--database", default="neo4j")
+    parser.add_argument("--uri", default=os.getenv("NEO4J_URI", "bolt://127.0.0.1:7687"))
+    parser.add_argument("--user", default=os.getenv("NEO4J_USER", "neo4j"))
+    parser.add_argument("--password", default=os.getenv("NEO4J_PASSWORD", "neo4j"))
+    parser.add_argument("--database", default=os.getenv("NEO4J_DATABASE", "neo4j"))
     parser.add_argument("--reset", action="store_true", help="Delete all nodes/relationships before seeding.")
     parser.add_argument("--num-person", type=int, default=20000)
     parser.add_argument("--num-city", type=int, default=2000)
@@ -63,10 +65,22 @@ def main() -> None:
     companies = [f"company_{i}" for i in range(args.num_company)]
     universities = [f"university_{i}" for i in range(args.num_university)]
 
-    driver = GraphDatabase.driver(args.uri, auth=(args.user, args.password))
+    try:
+        driver = GraphDatabase.driver(args.uri, auth=(args.user, args.password))
+    except Exception as exc:
+        raise SystemExit(f"[bench_seed_large] failed to create Neo4j driver: {exc}") from exc
     with driver.session(database=args.database) as session:
-        if args.reset:
-            session.run("MATCH (n) DETACH DELETE n").consume()
+        try:
+            if args.reset:
+                session.run("MATCH (n) DETACH DELETE n").consume()
+        except AuthError as exc:
+            raise SystemExit(
+                "[bench_seed_large] Neo4j authentication failed. "
+                "Please pass correct credentials, e.g.:\n"
+                "  python scripts/bench_seed_large.py "
+                "--uri bolt://127.0.0.1:7687 --user neo4j --password <your-password> --database neo4j --reset\n"
+                "or set env vars NEO4J_URI/NEO4J_USER/NEO4J_PASSWORD/NEO4J_DATABASE."
+            ) from exc
 
         upsert_entities(session, "Entity", persons, args.batch_size)
         upsert_entities(session, "Entity", cities, args.batch_size)
