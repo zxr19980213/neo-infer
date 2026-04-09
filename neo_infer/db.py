@@ -18,12 +18,22 @@ class Neo4jClient:
     def close(self) -> None:
         self.driver.close()
 
-    def run_read(self, query: str, parameters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        with self.driver.session(database=self.settings.neo4j_database) as session:
+    def run_read(
+        self,
+        query: str,
+        parameters: dict[str, Any] | None = None,
+        database: str | None = None,
+    ) -> list[dict[str, Any]]:
+        with self.driver.session(database=database or self.settings.neo4j_database) as session:
             result = session.run(query, parameters or {})
             return [r.data() for r in result]
 
-    def run_write(self, query: str, parameters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        with self.driver.session(database=self.settings.neo4j_database) as session:
+    def run_write(
+        self,
+        query: str,
+        parameters: dict[str, Any] | None = None,
+        database: str | None = None,
+    ) -> list[dict[str, Any]]:
+        with self.driver.session(database=database or self.settings.neo4j_database) as session:
             result = session.run(query, parameters or {})
             return [r.data() for r in result]

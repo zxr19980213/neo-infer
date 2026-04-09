@@ -22,7 +22,7 @@ class TriggerManager:
     def ensure_config_enabled(self) -> bool:
         """Best-effort check for APOC trigger availability."""
         try:
-            self._db.run_read("CALL apoc.help('trigger')")
+            self._db.run_read("CALL apoc.help('trigger')", database="system")
             return True
         except Exception:
             return False
@@ -102,6 +102,7 @@ class TriggerManager:
                     "name": self._trigger_name,
                     "statement": statement,
                 },
+                database="system",
             )
             if rows:
                 return any(bool(row.get("installed")) for row in rows)
@@ -118,6 +119,7 @@ class TriggerManager:
                     "name": self._trigger_name,
                     "statement": statement,
                 },
+                database="system",
             )
             if rows:
                 return any(bool(row.get("installed")) for row in rows)
@@ -153,6 +155,7 @@ class TriggerManager:
                     "name": self._trigger_name,
                     "statement": statement,
                 },
+                database="system",
             )
         except Exception as exc:
             diagnostic["install_error"] = f"install:{type(exc).__name__}:{exc}"
@@ -166,6 +169,7 @@ class TriggerManager:
                         "name": self._trigger_name,
                         "statement": statement,
                     },
+                    database="system",
                 )
             except Exception as exc2:
                 diagnostic["install_error"] = (
@@ -184,6 +188,11 @@ class TriggerManager:
             rows = self._db.run_read("CALL apoc.trigger.list()")
             return rows
         except Exception:
+            pass
+        try:
+            rows = self._db.run_read("CALL apoc.trigger.list()", database="system")
+            return rows
+        except Exception:
             return []
 
     def drop_trigger(self) -> bool:
@@ -197,6 +206,7 @@ class TriggerManager:
                     "database": self._db.settings.neo4j_database,
                     "name": self._trigger_name,
                 },
+                database="system",
             )
             return True
         except Exception:
@@ -208,6 +218,7 @@ class TriggerManager:
                 CALL apoc.trigger.remove($name)
                 """,
                 {"name": self._trigger_name},
+                database="system",
             )
             return True
         except Exception:
