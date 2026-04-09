@@ -40,6 +40,8 @@ PLAN                 # 总体实施计划
 - `MIN_CONFIDENCE`（默认 `0.1`）
 - `MAX_RULE_LENGTH`（默认 `2`）
 - `CONFLICT_RELATION_PAIRS`（可选兜底配置，格式：`headRel:conflictRel,relA:relB`）
+- `CHANGELOG_TRIGGER_AUTO_INSTALL`（默认 `0`，设为 `1` 则启动时自动安装 changelog trigger）
+- `CHANGELOG_TRIGGER_NAME`（默认 `neo_infer_changelog`）
 
 ## 运行
 ```bash
@@ -275,6 +277,8 @@ python scripts/bench_index_strategies.py \
 - `POST /inference/run`
 - `POST /changes/append`
 - `POST /rules/mine/incremental/from-changelog`
+- `POST /triggers/changelog/install`（安装/更新 DB Trigger）
+- `DELETE /triggers/changelog`（卸载 DB Trigger）
 
 ### 挖掘参数说明（关键）
 - `factual_only`（默认 `true`）：
@@ -287,6 +291,21 @@ python scripts/bench_index_strategies.py \
   - 每个 head relation 最多保留 K 条候选规则，防止头关系垄断。
 - `confidence_ub_weight`（默认 `0.0`）：
   - 基于局部统计收紧置信度上界（0~1），值越大预剪枝越激进。
+
+## 变更日志混合模式（Trigger + App）
+- 支持两种写入来源合并：
+  - `source=app`：通过 `/changes/append` 显式提交；
+  - `source=trigger`：由 APOC trigger 自动捕获 Neo4j 内部关系变更。
+- 去重策略：
+  - `ChangeLog.dedup_key` 唯一约束；
+  - App 通道可带 `batch_id` / `idempotency_key` / `context`；
+  - 增量消费窗口内会对同一 `(src, rel, dst)` 的 add/remove 进行折叠（同窗 add+remove 抵消）。
+- Trigger 自过滤：
+  - 默认跳过系统内部标签（`ChangeLog/IdSequence/IncrementalState/Rule/RuleStat/Conflict*`），避免自触发循环。
+- 启用方式：
+  - 自动安装（启动时）：`CHANGELOG_TRIGGER_AUTO_INSTALL=1`
+  - 手动安装：`POST /triggers/changelog/install`
+  - 手动卸载：`DELETE /triggers/changelog`
 
 ## 推理接口说明（增强）
 `POST /inference/run` 支持冲突检测字段：

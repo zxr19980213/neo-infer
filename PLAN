@@ -185,6 +185,12 @@ Neo4j 图数据库
 - **统计防污染机制**：
   - 挖掘侧新增 `factual_only` 开关（默认开启）；
   - body/support/PCA/head_count 与功能性统计默认排除 `is_inferred=true` 边，避免 benchmark 被历史推理边污染。
+- **ChangeLog 混合模式基础能力（已落地）**：
+  - App 通道支持 `batch_id` / `idempotency_key` / `context` 元信息；
+  - `ChangeLog.dedup_key` 唯一约束与索引落地，支持跨通道去重键策略；
+  - 增量消费窗口内对同一边事件做 add/remove 折叠，减少重复与抖动影响；
+  - 提供 trigger 管理接口：`POST /triggers/changelog/install`、`DELETE /triggers/changelog`；
+  - Trigger 默认过滤系统内部标签，避免 `ChangeLog` 与系统节点自触发循环。
 - **P1 工程化**：
   - Neo4j 索引/约束脚本化 + 启动幂等 bootstrap；
   - 查询批量化优化（按 head relation 分桶，减少 round-trip）；
@@ -197,6 +203,7 @@ Neo4j 图数据库
 ### 部分完成（可用但仍可深化）
 - **真增量计数**：已实现受影响规则增量更新闭环；事件级 +1/-1 原子计数（尽量免重算）仍可继续深化。
 - **AMIE+ 深层剪枝**：现有高收益剪枝已齐备，仍可继续补更强上界估计与跨层冗余证明型剪枝。
+- **DB Trigger 全量捕获**：已提供 APOC trigger 安装/卸载与自动安装开关，但跨 Neo4j/APOC 版本的一致性验证和删除关系场景稳定性仍需实库压测。
 
 ### 未完成（后续目标）
 - 规则质量评估闭环（precision/recall）与标准评测集。

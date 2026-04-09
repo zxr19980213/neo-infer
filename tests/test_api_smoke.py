@@ -30,6 +30,45 @@ def client_and_state(monkeypatch: pytest.MonkeyPatch):
         def close(self):
             return None
 
+    class FakeTriggerManager:
+        TRIGGER_NAME = "neo_infer_capture_changelog"
+
+        def __init__(self, db: FakeDB, trigger_name: str | None = None) -> None:
+            _ = db
+            self._name = trigger_name or self.TRIGGER_NAME
+            state.setdefault("trigger_installed", False)
+
+        def ensure_config_enabled(self) -> bool:
+            state["trigger_apoc_available"] = True
+            return True
+
+        def upsert_trigger(self) -> bool:
+            state["trigger_installed"] = True
+            return True
+
+        def drop_trigger(self) -> bool:
+            state["trigger_installed"] = False
+            return True
+
+    class FakeTriggerManager:
+        TRIGGER_NAME = "neo_infer_capture_changelog"
+
+        def __init__(self, db: FakeDB, trigger_name: str | None = None) -> None:
+            _ = db
+            self._name = trigger_name or self.TRIGGER_NAME
+
+        def ensure_config_enabled(self) -> bool:
+            state["trigger_enabled"] = True
+            return True
+
+        def upsert_trigger(self) -> bool:
+            state["trigger_installed"] = self._name
+            return True
+
+        def drop_trigger(self) -> bool:
+            state["trigger_dropped"] = self._name
+            return True
+
     class FakeQueryRepository:
         def __init__(self, driver: object, database: str = "neo4j") -> None:
             _ = driver
@@ -225,6 +264,7 @@ def client_and_state(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(api_module, "RuleMiningService", FakeRuleMiningService)
     monkeypatch.setattr(api_module, "RuleStore", FakeRuleStore)
     monkeypatch.setattr(api_module, "ConflictStore", FakeConflictStore)
+    monkeypatch.setattr(api_module, "TriggerManager", FakeTriggerManager)
 
     class FakeDelta:
         def __init__(self, op: str, src: str, rel: str, dst: str) -> None:
@@ -261,12 +301,39 @@ def client_and_state(monkeypatch: pytest.MonkeyPatch):
                 return None
             return type("RuleStatObj", (), data)()
 
-        def append_changes(self, changes):
-            state["changelog"].extend(changes)
+        def append_changes(
+            self,
+            added_edges=None,
+            removed_edges=None,
+            *,
+            source: str = "app",
+            batch_id: str | None = None,
+            idempotency_key: str | None = None,
+            context=None,
+        ):
+            _ = context
+            _ = source
+            _ = batch_id
+            _ = idempotency_key
+            if removed_edges is None and isinstance(added_edges, list):
+                state["changelog"].extend(added_edges)
+                return
+            for edge in added_edges or []:
+                state["changelog"].append(
+                    {"op": "add", "src": edge.src, "rel": edge.rel, "dst": edge.dst}
+                )
+            for edge in removed_edges or []:
+                state["changelog"].append(
+                    {"op": "remove", "src": edge.src, "rel": edge.rel, "dst": edge.dst}
+                )
 
         def fetch_unprocessed_changes(self):
             idx = state["cursor"]
             return state["changelog"][idx:]
+
+        def pending_changes(self, limit: int = 1000):
+            _ = limit
+            return []
 
         def mark_changes_processed(self, count: int):
             state["cursor"] += count
@@ -355,6 +422,7 @@ def client_and_state(monkeypatch: pytest.MonkeyPatch):
             "DeltaEdge",
             FakeDelta,
         )
+    monkeypatch.setattr(api_module, "TriggerManager", FakeTriggerManager)
     monkeypatch.setattr(api_module, "Neo4jClient", lambda settings: FakeDB())
     api_module.app.dependency_overrides[api_module.get_db] = lambda: FakeDB()
 
@@ -663,4 +731,30 @@ def test_schema_bootstrap_is_called(client_and_state):
     assert len(executed) >= 1
     assert any("CREATE CONSTRAINT rule_rule_id_unique" in stmt for stmt in executed)
     assert any("CREATE CONSTRAINT changelog_change_seq_unique" in stmt for stmt in executed)
+    assert any("CREATE CONSTRAINT changelog_dedup_key_unique" in stmt for stmt in executed)
+    assert any("CREATE INDEX changelog_source_idx" in stmt for stmt in executed)
+
+
+def test_changes_append_accepts_metadata_fields(client_and_state):
+    client, state = client_and_state
+    resp = client.post(
+        "/changes/append",
+        json={
+            "added_edges": [{"src": "n1", "rel": "bornIn", "dst": "n2"}],
+            "removed_edges": [],
+            "batch_id": "batch-1",
+            "idempotency_key": "idem-1",
+            "context": {"actor": "tester"},
+        },
+    )
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["pending_count"] >= 0
+    changelog = state.get("changelog", [])
+    assert changelog
+    first = changelog[0]
+    assert first["op"] == "add"
+    assert first["src"] == "n1"
+    assert first["dst"] == "n2"
+    assert first["rel"] == "bornIn"
 

@@ -18,6 +18,14 @@ class Settings:
     # 格式示例: "parentOf:childOf,nationality:foreignNationality"
     # 含义: 当推理 head=parentOf 时，如同向已存在 childOf 则视为冲突。
     conflict_relation_pairs: str = os.getenv("CONFLICT_RELATION_PAIRS", "")
+    changelog_trigger_auto_install: bool = os.getenv("CHANGELOG_TRIGGER_AUTO_INSTALL", "0") in {
+        "1",
+        "true",
+        "TRUE",
+        "yes",
+        "YES",
+    }
+    changelog_trigger_name: str = os.getenv("CHANGELOG_TRIGGER_NAME", "neo_infer_changelog")
 
 
 def get_settings() -> Settings:

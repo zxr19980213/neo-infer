@@ -170,6 +170,9 @@ class EdgeItem(BaseModel):
 class ChangeLogAppendRequest(BaseModel):
     added_edges: list[EdgeItem] = Field(default_factory=list)
     removed_edges: list[EdgeItem] = Field(default_factory=list)
+    batch_id: str | None = None
+    idempotency_key: str | None = None
+    context: dict[str, str] | None = None
 
 
 class ChangeLogEntry(BaseModel):
@@ -179,6 +182,8 @@ class ChangeLogEntry(BaseModel):
     relation: str
     dst_id: str
     created_at: str
+    source: str | None = None
+    batch_id: str | None = None
 
 
 class ChangeLogPendingResponse(BaseModel):

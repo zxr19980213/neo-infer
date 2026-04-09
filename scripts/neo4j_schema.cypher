@@ -14,6 +14,9 @@ FOR (c:ConflictRule) REQUIRE (c.head_relation, c.conflict_relation) IS UNIQUE;
 CREATE CONSTRAINT changelog_change_seq_unique IF NOT EXISTS
 FOR (c:ChangeLog) REQUIRE c.change_seq IS UNIQUE;
 
+CREATE CONSTRAINT changelog_dedup_key_unique IF NOT EXISTS
+FOR (c:ChangeLog) REQUIRE c.dedup_key IS UNIQUE;
+
 CREATE CONSTRAINT id_sequence_name_unique IF NOT EXISTS
 FOR (s:IdSequence) REQUIRE s.name IS UNIQUE;
 
@@ -35,4 +38,13 @@ FOR (cc:ConflictCase) REQUIRE (cc.rule_id, cc.conflicting_relation, cc.source_x,
 
 CREATE INDEX conflict_case_updated_at_idx IF NOT EXISTS
 FOR (cc:ConflictCase) ON (cc.updated_at);
+
+CREATE INDEX changelog_source_idx IF NOT EXISTS
+FOR (c:ChangeLog) ON (c.source);
+
+CREATE INDEX changelog_batch_id_idx IF NOT EXISTS
+FOR (c:ChangeLog) ON (c.batch_id);
+
+CREATE INDEX changelog_idempotency_key_idx IF NOT EXISTS
+FOR (c:ChangeLog) ON (c.idempotency_key);
 

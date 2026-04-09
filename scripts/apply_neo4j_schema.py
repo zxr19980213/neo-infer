@@ -51,6 +51,12 @@ def main() -> None:
             FOR (c:ChangeLog) REQUIRE c.change_seq IS UNIQUE
             """
         )
+        client.run_write(
+            """
+            CREATE CONSTRAINT change_log_dedup_key_unique IF NOT EXISTS
+            FOR (c:ChangeLog) REQUIRE c.dedup_key IS UNIQUE
+            """
+        )
 
         client.run_write(
             """
@@ -62,6 +68,24 @@ def main() -> None:
             """
             CREATE RANGE INDEX change_log_rel_idx IF NOT EXISTS
             FOR (c:ChangeLog) ON (c.rel)
+            """
+        )
+        client.run_write(
+            """
+            CREATE RANGE INDEX change_log_source_idx IF NOT EXISTS
+            FOR (c:ChangeLog) ON (c.source)
+            """
+        )
+        client.run_write(
+            """
+            CREATE RANGE INDEX change_log_batch_id_idx IF NOT EXISTS
+            FOR (c:ChangeLog) ON (c.batch_id)
+            """
+        )
+        client.run_write(
+            """
+            CREATE RANGE INDEX change_log_idempotency_key_idx IF NOT EXISTS
+            FOR (c:ChangeLog) ON (c.idempotency_key)
             """
         )
         client.run_write(

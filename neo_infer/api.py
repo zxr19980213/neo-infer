@@ -8,6 +8,7 @@ from neo_infer.db import Neo4jClient
 from neo_infer.incremental_mining import IncrementalMiningService
 from neo_infer.incremental_store import IncrementalStore
 from neo_infer.inference import InferenceEngine
+from neo_infer.trigger_management import TriggerManager
 from neo_infer.models import (
     ChangeEdge,
     ChangeLogAppendRequest,
@@ -32,6 +33,10 @@ from neo_infer.rule_mining import MiningConfig, RuleMiningService
 app = FastAPI(title="neo-infer", version="0.1.0")
 
 
+def _trigger_manager(db: Neo4jClient, settings: Settings) -> TriggerManager:
+    return TriggerManager(db, trigger_name=settings.changelog_trigger_name)
+
+
 def ensure_neo4j_schema(db: Neo4jClient) -> None:
     """Best-effort schema bootstrap for indexes/constraints."""
     statements = [
@@ -42,8 +47,12 @@ def ensure_neo4j_schema(db: Neo4jClient) -> None:
         "CREATE CONSTRAINT incremental_state_name_unique IF NOT EXISTS FOR (s:IncrementalState) REQUIRE s.name IS UNIQUE",
         "CREATE CONSTRAINT id_sequence_name_unique IF NOT EXISTS FOR (s:IdSequence) REQUIRE s.name IS UNIQUE",
         "CREATE CONSTRAINT changelog_change_seq_unique IF NOT EXISTS FOR (c:ChangeLog) REQUIRE c.change_seq IS UNIQUE",
+        "CREATE CONSTRAINT changelog_dedup_key_unique IF NOT EXISTS FOR (c:ChangeLog) REQUIRE c.dedup_key IS UNIQUE",
         "CREATE INDEX changelog_event_type_idx IF NOT EXISTS FOR (c:ChangeLog) ON (c.event_type)",
         "CREATE INDEX changelog_rel_idx IF NOT EXISTS FOR (c:ChangeLog) ON (c.rel)",
+        "CREATE INDEX changelog_source_idx IF NOT EXISTS FOR (c:ChangeLog) ON (c.source)",
+        "CREATE INDEX changelog_batch_id_idx IF NOT EXISTS FOR (c:ChangeLog) ON (c.batch_id)",
+        "CREATE INDEX changelog_idempotency_key_idx IF NOT EXISTS FOR (c:ChangeLog) ON (c.idempotency_key)",
         "CREATE INDEX rule_head_relation_idx IF NOT EXISTS FOR (r:Rule) ON (r.head_relation)",
         "CREATE INDEX rule_status_idx IF NOT EXISTS FOR (r:Rule) ON (r.status)",
         "CREATE INDEX conflictcase_rule_id_idx IF NOT EXISTS FOR (c:ConflictCase) ON (c.rule_id)",
@@ -57,10 +66,21 @@ def _append_changes_compat(
     *,
     added: list[ChangeEdge],
     removed: list[ChangeEdge],
+    source: str = "app",
+    batch_id: str | None = None,
+    idempotency_key: str | None = None,
+    context: dict[str, str] | None = None,
 ) -> None:
     """Support both new and legacy IncrementalStore append signatures."""
     try:
-        store.append_changes(added_edges=added, removed_edges=removed)
+        store.append_changes(
+            added_edges=added,
+            removed_edges=removed,
+            source=source,
+            batch_id=batch_id,
+            idempotency_key=idempotency_key,
+            context=context,
+        )
         return
     except TypeError:
         pass
@@ -73,6 +93,16 @@ def _append_changes_compat(
         for edge in removed
     ]
     store.append_changes(legacy_changes)
+
+
+def _trigger_manager_status(manager: TriggerManager) -> dict[str, object]:
+    try:
+        return manager.status()
+    except Exception as exc:
+        return {
+            "enabled": False,
+            "error": str(exc),
+        }
 
 
 def _legacy_pending_relations(store: IncrementalStore) -> tuple[list[str], int]:
@@ -113,6 +143,9 @@ def on_startup() -> None:
     db = Neo4jClient(settings)
     try:
         ensure_neo4j_schema(db)
+        manager = _trigger_manager(db, settings)
+        if settings.changelog_trigger_auto_install and manager.ensure_config_enabled():
+            manager.upsert_trigger()
     finally:
         db.close()
 
@@ -165,7 +198,15 @@ def append_changes(
 
     added = [_edge_from_item(item) for item in payload.added_edges]
     removed = [_edge_from_item(item) for item in payload.removed_edges]
-    _append_changes_compat(store, added=added, removed=removed)
+    _append_changes_compat(
+        store,
+        added=added,
+        removed=removed,
+        source="app",
+        batch_id=payload.batch_id,
+        idempotency_key=payload.idempotency_key,
+        context=payload.context,
+    )
     pending = store.pending_changes(limit=1000)
     return ChangeLogPendingResponse(
         pending_count=len(pending),
@@ -186,7 +227,7 @@ def append_changes_legacy_log(
         ChangeEdge(src=item.src_id, rel=item.rel, dst=item.dst_id, created_at=item.created_at)
         for item in payload.removed_edges
     ]
-    _append_changes_compat(store, added=added, removed=removed)
+    _append_changes_compat(store, added=added, removed=removed, source="app-legacy")
     return {"added": len(added), "removed": len(removed)}
 
 
@@ -213,8 +254,29 @@ def append_changes_legacy_batch(
             removed.append(edge)
         else:
             added.append(edge)
-    _append_changes_compat(IncrementalStore(db), added=added, removed=removed)
+    _append_changes_compat(IncrementalStore(db), added=added, removed=removed, source="app-legacy")
     return {"appended": len(added) + len(removed)}
+
+
+@app.post("/triggers/changelog/install")
+def install_changelog_trigger(
+    settings: Settings = Depends(get_settings),
+    db: Neo4jClient = Depends(get_db),
+) -> dict[str, str]:
+    manager = _trigger_manager(db, settings)
+    if not manager.ensure_config_enabled():
+        raise HTTPException(status_code=412, detail="APOC trigger not available")
+    manager.upsert_trigger()
+    return {"status": "installed", "name": settings.changelog_trigger_name}
+
+
+@app.delete("/triggers/changelog")
+def drop_changelog_trigger(
+    settings: Settings = Depends(get_settings),
+    db: Neo4jClient = Depends(get_db),
+) -> dict[str, str]:
+    _trigger_manager(db, settings).drop_trigger()
+    return {"status": "dropped", "name": settings.changelog_trigger_name}
 
 
 @app.post("/rules/mine/length3", response_model=MineRulesResponse)
