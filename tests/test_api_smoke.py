@@ -48,6 +48,17 @@ def client_and_state(monkeypatch: pytest.MonkeyPatch):
         def list_triggers(self):
             return []
 
+        def diagnose_install(self):
+            return {
+                "database": "neo4j",
+                "trigger_name": self._name,
+                "apoc_available": True,
+                "install_attempt": "install",
+                "install_error": None,
+                "list_error": None,
+                "list_names": [],
+            }
+
         def drop_trigger(self) -> bool:
             state["trigger_dropped"] = self._name
             return True
@@ -722,7 +733,9 @@ def test_trigger_install_returns_500_when_not_listed(client_and_state):
     client, _state = client_and_state
     resp = client.post("/triggers/changelog/install")
     assert resp.status_code == 500
-    assert "not listed" in resp.json()["detail"]
+    detail = resp.json()["detail"]
+    assert "not listed" in detail["message"]
+    assert "diagnostic" in detail
 
 
 def test_changes_append_accepts_metadata_fields(client_and_state):

@@ -125,6 +125,60 @@ class TriggerManager:
         except Exception:
             return False
 
+    def diagnose_install(self) -> dict[str, object]:
+        """Return verbose diagnostics for trigger install issues."""
+        diagnostic: dict[str, object] = {
+            "database": self._db.settings.neo4j_database,
+            "trigger_name": self._trigger_name,
+            "apoc_available": False,
+            "install_attempt": None,
+            "install_error": None,
+            "list_error": None,
+            "list_names": [],
+        }
+        diagnostic["apoc_available"] = self.ensure_config_enabled()
+        if not diagnostic["apoc_available"]:
+            return diagnostic
+
+        statement = self._trigger_statement()
+        self.drop_trigger()
+        try:
+            diagnostic["install_attempt"] = "install"
+            self._db.run_write(
+                """
+                CALL apoc.trigger.install($database, $name, $statement, {}, {phase: "afterAsync"})
+                """,
+                {
+                    "database": self._db.settings.neo4j_database,
+                    "name": self._trigger_name,
+                    "statement": statement,
+                },
+            )
+        except Exception as exc:
+            diagnostic["install_error"] = f"install:{type(exc).__name__}:{exc}"
+            try:
+                diagnostic["install_attempt"] = "add"
+                self._db.run_write(
+                    """
+                    CALL apoc.trigger.add($name, $statement, {}, {phase: "afterAsync"})
+                    """,
+                    {
+                        "name": self._trigger_name,
+                        "statement": statement,
+                    },
+                )
+            except Exception as exc2:
+                diagnostic["install_error"] = (
+                    f"{diagnostic['install_error']} | add:{type(exc2).__name__}:{exc2}"
+                )
+
+        try:
+            rows = self.list_triggers()
+            diagnostic["list_names"] = [str(item.get("name", "")) for item in rows]
+        except Exception as exc:
+            diagnostic["list_error"] = f"{type(exc).__name__}:{exc}"
+        return diagnostic
+
     def list_triggers(self) -> list[dict[str, object]]:
         try:
             rows = self._db.run_read("CALL apoc.trigger.list()")
