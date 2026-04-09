@@ -43,6 +43,44 @@ PLAN                 # 总体实施计划
 - `CHANGELOG_TRIGGER_AUTO_INSTALL`（默认 `0`，设为 `1` 则启动时自动安装 changelog trigger）
 - `CHANGELOG_TRIGGER_NAME`（默认 `neo_infer_changelog`）
 
+## Neo4j / APOC 前置要求
+### 1) Neo4j 版本
+- 建议 Neo4j 5.x（当前 Trigger 管理优先适配 `apoc.trigger.install/drop`）。
+- 社区版可用；`SHOW SERVERS` 在社区版不支持，属于正常现象。
+
+### 2) APOC 插件
+- 需要安装与 Neo4j **同大版本**的 APOC（例如 Neo4j 5.x 对应 APOC 5.x）。
+- 将 APOC jar 放到 Neo4j `plugins/` 目录，重启 Neo4j。
+
+### 3) 配置项（neo4j.conf / apoc.conf）
+- 允许 APOC procedure：
+  - `dbms.security.procedures.allowlist=apoc.*`
+  - `dbms.security.procedures.unrestricted=apoc.*`
+- 开启 trigger：
+  - `apoc.trigger.enabled=true`
+
+### 4) 基础连通性验证
+在 Neo4j Browser 或 cypher-shell 中执行：
+```cypher
+RETURN apoc.version();
+CALL apoc.help("trigger");
+CALL apoc.trigger.list();
+```
+
+### 5) Trigger 安装方式
+- API 手动安装（推荐）：
+  - `POST /triggers/changelog/install`
+- API 卸载：
+  - `DELETE /triggers/changelog`
+- 自动安装（可选）：
+  - 设置 `CHANGELOG_TRIGGER_AUTO_INSTALL=1`，服务启动时自动尝试安装。
+
+### 6) 常见问题
+- 若安装时报 `No write operations are allowed ... FOLLOWER`：
+  - 通常是连接到了不可写节点；单机请确认 `NEO4J_URI` 指向本机可写 bolt 端点（如 `bolt://127.0.0.1:7687`）。
+- 若 API 返回“installed”但 `apoc.trigger.list()` 为空：
+  - 先重试安装接口；当前服务会跨库检查并带诊断信息返回。
+
 ## 运行
 ```bash
 pip install -e .
