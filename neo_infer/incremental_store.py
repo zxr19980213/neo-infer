@@ -93,10 +93,11 @@ class IncrementalStore:
             """
             MERGE (counter:IdSequence {name: 'ChangeLog'})
             ON CREATE SET counter.next_seq = 1
-            WITH counter, $events AS events
-            WITH counter, events, toInteger(counter.next_seq) AS start_seq
-            UNWIND range(0, size(events) - 1) AS idx
-            WITH counter, start_seq, events[idx] AS event, start_seq + idx AS seq
+            WITH counter, $events AS events, size($events) AS event_count
+            SET counter.next_seq = toInteger(counter.next_seq) + event_count
+            WITH events, event_count, toInteger(counter.next_seq) AS end_seq
+            UNWIND range(0, event_count - 1) AS idx
+            WITH events[idx] AS event, end_seq - event_count + idx AS seq
             MERGE (c:ChangeLog {dedup_key: event.dedup_key})
             ON CREATE SET c.change_seq = seq,
                           c.event_type = event.event_type,
@@ -108,10 +109,23 @@ class IncrementalStore:
                           c.idempotency_key = event.idempotency_key,
                           c.metadata = event.metadata,
                           c.created_at = coalesce(event.created_at, datetime())
-            WITH counter, start_seq, max(seq) AS last_seq
-            SET counter.next_seq = coalesce(last_seq, start_seq - 1) + 1
             """,
             {"events": payload},
+        )
+        self._client.run_write(
+            """
+            MATCH (c:ChangeLog)
+            WHERE c.change_seq IS NULL
+            WITH c ORDER BY c.created_at ASC
+            MERGE (counter:IdSequence {name: 'ChangeLog'})
+            ON CREATE SET counter.next_seq = 1
+            WITH counter, collect(c) AS rows
+            UNWIND range(0, size(rows) - 1) AS idx
+            WITH counter, rows[idx] AS row, idx
+            SET row.change_seq = toInteger(counter.next_seq) + idx
+            WITH counter, size(rows) AS assigned
+            SET counter.next_seq = toInteger(counter.next_seq) + assigned
+            """,
         )
 
     def append_changelog(self, batch: EdgeDeltaBatch) -> tuple[int, int, int]:
@@ -148,6 +162,7 @@ class IncrementalStore:
             """
             MATCH (c:ChangeLog)
             WHERE toInteger(coalesce(c.change_seq, 0)) > $cursor
+               OR (c.change_seq IS NULL AND toInteger($cursor) < 0)
             RETURN toInteger(coalesce(c.change_seq, 0)) AS change_id,
                    c.event_type AS event_type,
                    c.src AS src,
@@ -211,6 +226,7 @@ class IncrementalStore:
             """
             MATCH (c:ChangeLog)
             WHERE toInteger(coalesce(c.change_seq, 0)) > $cursor
+               OR (c.change_seq IS NULL AND toInteger($cursor) < 0)
             RETURN toString(toInteger(coalesce(c.change_seq, 0))) AS change_id,
                    c.event_type AS op,
                    c.src AS src_id,

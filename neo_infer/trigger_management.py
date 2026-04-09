@@ -48,15 +48,22 @@ class TriggerManager:
              $deletedRelationships AS deletedRels,
              coalesce($metaData,{{}}) AS meta
         WHERE coalesce(meta.skip_changelog, false) = false
+        WITH [rel IN createdRels
+              WHERE NOT any(lbl IN labels(startNode(rel)) WHERE lbl IN [{labels}])
+                AND NOT any(lbl IN labels(endNode(rel)) WHERE lbl IN [{labels}])] AS createdFiltered,
+             [rel IN deletedRels
+              WHERE NOT any(lbl IN labels(startNode(rel)) WHERE lbl IN [{labels}])
+                AND NOT any(lbl IN labels(endNode(rel)) WHERE lbl IN [{labels}])] AS deletedFiltered
         CALL {{
-          WITH createdRels
-          UNWIND createdRels AS rel
-          WITH rel
-          WHERE NOT any(lbl IN labels(startNode(rel)) WHERE lbl IN [{labels}])
-            AND NOT any(lbl IN labels(endNode(rel)) WHERE lbl IN [{labels}])
+          WITH createdFiltered
           MERGE (counter:IdSequence {{name: "ChangeLog"}})
           ON CREATE SET counter.next_seq = 1
-          WITH counter, rel, toInteger(counter.next_seq) AS seq
+          WITH counter, createdFiltered, toInteger(counter.next_seq) AS start_seq, size(createdFiltered) AS rel_count
+          SET counter.next_seq = start_seq + rel_count
+          WITH createdFiltered, start_seq, rel_count,
+               CASE WHEN rel_count = 0 THEN [] ELSE range(0, rel_count - 1) END AS indexes
+          UNWIND indexes AS idx
+          WITH createdFiltered[idx] AS rel, start_seq + idx AS seq
           MERGE (c:ChangeLog {{dedup_key: "trigger|add|" + elementId(rel)}})
           ON CREATE SET c.change_seq = seq,
                         c.event_type = "added",
@@ -67,20 +74,18 @@ class TriggerManager:
                         c.batch_id = "trigger",
                         c.idempotency_key = "trigger",
                         c.created_at = datetime()
-          WITH counter, c, seq
-          WHERE c.change_seq = seq
-          SET counter.next_seq = seq + 1
           RETURN count(*) AS created_count
         }}
         CALL {{
-          WITH deletedRels
-          UNWIND deletedRels AS rel
-          WITH rel
-          WHERE NOT any(lbl IN labels(startNode(rel)) WHERE lbl IN [{labels}])
-            AND NOT any(lbl IN labels(endNode(rel)) WHERE lbl IN [{labels}])
+          WITH deletedFiltered
           MERGE (counter:IdSequence {{name: "ChangeLog"}})
           ON CREATE SET counter.next_seq = 1
-          WITH counter, rel, toInteger(counter.next_seq) AS seq
+          WITH counter, deletedFiltered, toInteger(counter.next_seq) AS start_seq, size(deletedFiltered) AS rel_count
+          SET counter.next_seq = start_seq + rel_count
+          WITH deletedFiltered, start_seq, rel_count,
+               CASE WHEN rel_count = 0 THEN [] ELSE range(0, rel_count - 1) END AS indexes
+          UNWIND indexes AS idx
+          WITH deletedFiltered[idx] AS rel, start_seq + idx AS seq
           MERGE (c:ChangeLog {{dedup_key: "trigger|del|" + elementId(rel)}})
           ON CREATE SET c.change_seq = seq,
                         c.event_type = "removed",
@@ -91,9 +96,6 @@ class TriggerManager:
                         c.batch_id = "trigger",
                         c.idempotency_key = "trigger",
                         c.created_at = datetime()
-          WITH counter, c, seq
-          WHERE c.change_seq = seq
-          SET counter.next_seq = seq + 1
           RETURN count(*) AS removed_count
         }}
         RETURN 1 AS ok
