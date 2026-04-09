@@ -266,7 +266,12 @@ def install_changelog_trigger(
     manager = _trigger_manager(db, settings)
     if not manager.ensure_config_enabled():
         raise HTTPException(status_code=412, detail="APOC trigger not available")
-    manager.upsert_trigger()
+    installed = manager.upsert_trigger()
+    if not installed:
+        raise HTTPException(status_code=500, detail="failed to install APOC trigger")
+    listed = manager.list_triggers()
+    if not any(str(item.get("name", "")) == settings.changelog_trigger_name for item in listed):
+        raise HTTPException(status_code=500, detail="trigger install reported success but was not listed")
     return {"status": "installed", "name": settings.changelog_trigger_name}
 
 

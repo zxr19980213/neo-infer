@@ -93,9 +93,9 @@ class TriggerManager:
         self.drop_trigger()
         # Neo4j 5+ APOC style.
         try:
-            self._db.run_write(
+            rows = self._db.run_write(
                 """
-                CALL apoc.trigger.install($database, $name, $statement, {phase: "afterAsync"})
+                CALL apoc.trigger.install($database, $name, $statement, {}, {phase: "afterAsync"})
                 """,
                 {
                     "database": self._db.settings.neo4j_database,
@@ -103,23 +103,34 @@ class TriggerManager:
                     "statement": statement,
                 },
             )
+            if rows:
+                return any(bool(row.get("installed")) for row in rows)
             return True
         except Exception:
             pass
         # Neo4j 4.x APOC fallback.
         try:
-            self._db.run_write(
+            rows = self._db.run_write(
                 """
-                CALL apoc.trigger.add($name, $statement, {phase: "afterAsync"})
+                CALL apoc.trigger.add($name, $statement, {}, {phase: "afterAsync"})
                 """,
                 {
                     "name": self._trigger_name,
                     "statement": statement,
                 },
             )
+            if rows:
+                return any(bool(row.get("installed")) for row in rows)
             return True
         except Exception:
             return False
+
+    def list_triggers(self) -> list[dict[str, object]]:
+        try:
+            rows = self._db.run_read("CALL apoc.trigger.list()")
+            return rows
+        except Exception:
+            return []
 
     def drop_trigger(self) -> bool:
         # Neo4j 5+ APOC style.

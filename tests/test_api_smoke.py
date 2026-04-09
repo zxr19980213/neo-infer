@@ -36,26 +36,6 @@ def client_and_state(monkeypatch: pytest.MonkeyPatch):
         def __init__(self, db: FakeDB, trigger_name: str | None = None) -> None:
             _ = db
             self._name = trigger_name or self.TRIGGER_NAME
-            state.setdefault("trigger_installed", False)
-
-        def ensure_config_enabled(self) -> bool:
-            state["trigger_apoc_available"] = True
-            return True
-
-        def upsert_trigger(self) -> bool:
-            state["trigger_installed"] = True
-            return True
-
-        def drop_trigger(self) -> bool:
-            state["trigger_installed"] = False
-            return True
-
-    class FakeTriggerManager:
-        TRIGGER_NAME = "neo_infer_capture_changelog"
-
-        def __init__(self, db: FakeDB, trigger_name: str | None = None) -> None:
-            _ = db
-            self._name = trigger_name or self.TRIGGER_NAME
 
         def ensure_config_enabled(self) -> bool:
             state["trigger_enabled"] = True
@@ -64,6 +44,9 @@ def client_and_state(monkeypatch: pytest.MonkeyPatch):
         def upsert_trigger(self) -> bool:
             state["trigger_installed"] = self._name
             return True
+
+        def list_triggers(self):
+            return []
 
         def drop_trigger(self) -> bool:
             state["trigger_dropped"] = self._name
@@ -733,6 +716,13 @@ def test_schema_bootstrap_is_called(client_and_state):
     assert any("CREATE CONSTRAINT changelog_change_seq_unique" in stmt for stmt in executed)
     assert any("CREATE CONSTRAINT changelog_dedup_key_unique" in stmt for stmt in executed)
     assert any("CREATE INDEX changelog_source_idx" in stmt for stmt in executed)
+
+
+def test_trigger_install_returns_500_when_not_listed(client_and_state):
+    client, _state = client_and_state
+    resp = client.post("/triggers/changelog/install")
+    assert resp.status_code == 500
+    assert "not listed" in resp.json()["detail"]
 
 
 def test_changes_append_accepts_metadata_fields(client_and_state):
