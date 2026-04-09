@@ -302,10 +302,20 @@ python scripts/bench_index_strategies.py \
   - 增量消费窗口内会对同一 `(src, rel, dst)` 的 add/remove 进行折叠（同窗 add+remove 抵消）。
 - Trigger 自过滤：
   - 默认跳过系统内部标签（`ChangeLog/IdSequence/IncrementalState/Rule/RuleStat/Conflict*`），避免自触发循环。
+- 触发器与序号策略：
+  - Trigger 回调不直接分配 `change_seq`（避免并发事务下唯一键冲突）；
+  - `change_seq` 由应用侧在消费/查询前统一补齐并推进，保证游标稳定。
 - 启用方式：
   - 自动安装（启动时）：`CHANGELOG_TRIGGER_AUTO_INSTALL=1`
   - 手动安装：`POST /triggers/changelog/install`
   - 手动卸载：`DELETE /triggers/changelog`
+
+### ChangeLog 保留与清理建议
+- 默认建议：**消费后保留**（便于审计、回放、排障）。
+- 清理策略建议：
+  - 按时间窗口（如保留最近 30 天）；
+  - 或按消费游标与条数阈值（如仅保留最近 N 条已消费日志）。
+- 不建议“消费即删”，否则会降低可追溯性。
 
 ## 推理接口说明（增强）
 `POST /inference/run` 支持冲突检测字段：
