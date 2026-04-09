@@ -178,7 +178,13 @@ Neo4j 图数据库
   - `POST /changes/append` + `POST /rules/mine/incremental/from-changelog` 可用；
   - 覆盖非空 delta、混合 add/remove、幂等重复消费；
   - length3 增量从“全量后过滤”升级为增量候选路径。
-- **AMIE/AMIE+ 搜索框架骨架**：挖掘流程已改造为 `dangling -> closing -> 阈值剪枝` 的结构化流程（length2/length3）。
+- **AMIE/AMIE+ 搜索框架**（P0-1 已落地）：
+  - `dangling -> closing -> 阈值剪枝` 结构化流程（length2/length3）；
+  - canonical 去重、support/no-gain 剪枝、optimistic confidence upper-bound；
+  - 第二批剪枝：`beam_width`（层级 Top-B）、`head_budget_per_relation`（head 分桶预算）、局部统计收紧 `confidence_ub_weight`。
+- **统计防污染机制**：
+  - 挖掘侧新增 `factual_only` 开关（默认开启）；
+  - body/support/PCA/head_count 与功能性统计默认排除 `is_inferred=true` 边，避免 benchmark 被历史推理边污染。
 - **P1 工程化**：
   - Neo4j 索引/约束脚本化 + 启动幂等 bootstrap；
   - 查询批量化优化（按 head relation 分桶，减少 round-trip）；
@@ -189,8 +195,8 @@ Neo4j 图数据库
   - 索引策略对比：`scripts/bench_index_strategies.py`
 
 ### 部分完成（可用但仍可深化）
-- **AMIE+ 高效搜索**：已有结构化候选扩展与剪枝骨架，但尚未补齐更系统的 AMIE+ 高级剪枝（如更强冗余/功能依赖约束驱动剪枝）。
 - **真增量计数**：已实现受影响规则增量更新闭环；事件级 +1/-1 原子计数（尽量免重算）仍可继续深化。
+- **AMIE+ 深层剪枝**：现有高收益剪枝已齐备，仍可继续补更强上界估计与跨层冗余证明型剪枝。
 
 ### 未完成（后续目标）
 - 规则质量评估闭环（precision/recall）与标准评测集。
@@ -201,16 +207,15 @@ Neo4j 图数据库
 
 ## 10. 下一阶段优先级（重排）
 
-### P0（必须优先）
-1) **AMIE+ 剪枝补全（高收益）**
-   - 在现有 dangling/closing 框架上补强冗余规则剪枝与搜索空间控制；
-   - 输出“剪枝前后候选规模、耗时、规则质量”对比。
-2) **事件级增量计数（support/pca_denom/head_count）**
+### P0（当前最优先）
+1) **事件级增量计数（support/pca_denom/head_count）**
    - 从“受影响规则重算”继续收敛到“事件驱动原子更新”；
    - length2 先稳定，再扩展到 length3。
-3) **真实大图集成压测闭环**
+2) **真实大图集成压测闭环**
    - 固定数据规模与负载模板，输出 mean/p95/max、失败率、资源利用；
    - 索引策略迭代形成可复现基线报告。
+3) **规则质量评估基线**
+   - 增加 precision/recall 或 holdout 评估，避免仅靠 support/confidence 排序。
 
 ### P1（工程增强）
 1) 生命周期与运行稳定性：

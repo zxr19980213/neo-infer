@@ -7,9 +7,14 @@
   - `r1(X,Z) ∧ r2(Z,Y) -> r3(X,Y)`
   - `r1(X,A) ∧ r2(A,B) ∧ r3(B,Y) -> r4(X,Y)`
 - 指标：`support`、`pca_confidence`、`head_coverage`
+- AMIE+ 搜索骨架与剪枝（已接入）：
+  - dangling -> closing 分层搜索
+  - canonical 去重、support/no-gain 剪枝、confidence upper-bound 预剪枝
+  - `beam_width`（层级 Top-B）与 `head_budget_per_relation`（按 head 配额）
 - 规则管理：`discovered / adopted / applied / rejected`
 - 规则应用：已采纳规则单轮推理，写入 `is_inferred=true` 的关系
 - 冲突管理：数据库持久化冲突规则 + 冲突实例落库（`ConflictCase`）
+- 增量挖掘：`ChangeLog(change_seq)` 驱动，支持 from-changelog 非空/混合 add-remove/幂等消费
 
 ## 项目结构
 ```text
@@ -212,6 +217,11 @@ python scripts/bench_api_perf.py \
 - 每次请求的状态码与关键计数（rule 数、processed_changes 等）
 - JSON 结果可落盘用于对比（`--output-json` / `--out`）
 
+基准建议：
+- 先 `bench_seed_large.py --reset`，再执行挖掘压测，避免历史图状态影响结果。
+- 若要评估“纯事实图”的规则质量，保持 `factual_only=true`（默认值）。
+- 若要评估“事实+推理混合图”统计，可显式传 `factual_only=false`。
+
 ### 3) 索引策略自动对比
 ```bash
 python scripts/bench_index_strategies.py \
@@ -271,6 +281,12 @@ python scripts/bench_index_strategies.py \
   - 当为 `true` 时，规则挖掘相关统计（body 候选、support、PCA 分母、head 计数）仅使用事实边（`is_inferred != true`）。
   - 用于避免 benchmark 被历史推理边污染，建议保持默认值。
   - 如需包含推理边参与统计，可显式传 `false`。
+- `beam_width`（可选）：
+  - 每层 body 扩展仅保留 Top-B 候选，控制搜索空间。
+- `head_budget_per_relation`（可选）：
+  - 每个 head relation 最多保留 K 条候选规则，防止头关系垄断。
+- `confidence_ub_weight`（默认 `0.0`）：
+  - 基于局部统计收紧置信度上界（0~1），值越大预剪枝越激进。
 
 ## 推理接口说明（增强）
 `POST /inference/run` 支持冲突检测字段：
