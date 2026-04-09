@@ -56,17 +56,9 @@ class TriggerManager:
                 AND NOT any(lbl IN labels(endNode(rel)) WHERE lbl IN [{labels}])] AS deletedFiltered
         CALL {{
           WITH createdFiltered
-          MERGE (counter:IdSequence {{name: "ChangeLog"}})
-          ON CREATE SET counter.next_seq = 1
-          WITH counter, createdFiltered, toInteger(counter.next_seq) AS start_seq, size(createdFiltered) AS rel_count
-          SET counter.next_seq = start_seq + rel_count
-          WITH createdFiltered, start_seq, rel_count,
-               CASE WHEN rel_count = 0 THEN [] ELSE range(0, rel_count - 1) END AS indexes
-          UNWIND indexes AS idx
-          WITH createdFiltered[idx] AS rel, start_seq + idx AS seq
+          UNWIND createdFiltered AS rel
           MERGE (c:ChangeLog {{dedup_key: "trigger|add|" + elementId(rel)}})
-          ON CREATE SET c.change_seq = seq,
-                        c.event_type = "added",
+          ON CREATE SET c.event_type = "added",
                         c.src = coalesce(startNode(rel).id, elementId(startNode(rel))),
                         c.rel = type(rel),
                         c.dst = coalesce(endNode(rel).id, elementId(endNode(rel))),
@@ -78,17 +70,9 @@ class TriggerManager:
         }}
         CALL {{
           WITH deletedFiltered
-          MERGE (counter:IdSequence {{name: "ChangeLog"}})
-          ON CREATE SET counter.next_seq = 1
-          WITH counter, deletedFiltered, toInteger(counter.next_seq) AS start_seq, size(deletedFiltered) AS rel_count
-          SET counter.next_seq = start_seq + rel_count
-          WITH deletedFiltered, start_seq, rel_count,
-               CASE WHEN rel_count = 0 THEN [] ELSE range(0, rel_count - 1) END AS indexes
-          UNWIND indexes AS idx
-          WITH deletedFiltered[idx] AS rel, start_seq + idx AS seq
+          UNWIND deletedFiltered AS rel
           MERGE (c:ChangeLog {{dedup_key: "trigger|del|" + elementId(rel)}})
-          ON CREATE SET c.change_seq = seq,
-                        c.event_type = "removed",
+          ON CREATE SET c.event_type = "removed",
                         c.src = coalesce(startNode(rel).id, elementId(startNode(rel))),
                         c.rel = type(rel),
                         c.dst = coalesce(endNode(rel).id, elementId(endNode(rel))),
