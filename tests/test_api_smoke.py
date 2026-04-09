@@ -761,3 +761,11 @@ def test_changes_append_accepts_metadata_fields(client_and_state):
     assert first["dst"] == "n2"
     assert first["rel"] == "bornIn"
 
+
+def test_console_page_smoke(client_and_state):
+    client, _state = client_and_state
+    resp = client.get("/console")
+    assert resp.status_code == 200
+    assert "neo-infer Console" in resp.text
+    assert "/rules/mine" in resp.text
+

@@ -87,6 +87,37 @@ pip install -e .
 uvicorn main:app --reload
 ```
 
+## 更简单交互（CLI + Web 控制台）
+### 1) 轻量 CLI
+安装后可直接使用：
+```bash
+neo-infer --help
+neo-infer health
+neo-infer mine --body-length 2 --limit 100 --min-support 1 --min-pca-confidence 0.1
+neo-infer rules list --status discovered --limit 50
+neo-infer infer --limit-rules 100 --fixpoint --max-iterations 5
+neo-infer changes append --add "u1,bornIn,u2" --add "u2,locatedIn,u3"
+neo-infer incremental consume --body-length 2 --limit 100 --change-limit 1000
+neo-infer trigger install
+```
+
+如 API 不在本机 `8000` 端口，可加全局参数：
+```bash
+neo-infer --api-base http://127.0.0.1:9000 health
+```
+
+### 2) 轻量 Web 控制台
+服务启动后浏览器打开：
+```text
+http://127.0.0.1:8000/console
+```
+控制台提供常用操作按钮与参数输入：
+- Health / 规则列表 / 冲突实例查询
+- 规则挖掘（`/rules/mine`）
+- 推理执行（`/inference/run`）
+- 变更追加（`/changes/append`）
+- 增量消费（`/rules/mine/incremental/from-changelog`）
+
 ## 本地 Neo4j 完整测试流程（不含 Docker）
 以下流程假设你已在本地启动并可访问 Neo4j。
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 
 from neo_infer.config import Settings, get_settings, parse_conflict_relation_pairs
 from neo_infer.conflict_management import ConflictStore
@@ -33,6 +34,152 @@ from neo_infer.rule_management import RuleStore
 from neo_infer.rule_mining import MiningConfig, RuleMiningService
 
 app = FastAPI(title="neo-infer", version="0.1.0")
+
+CONSOLE_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>neo-infer console</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 18px; max-width: 980px; }
+    h1 { margin-bottom: 0.2rem; }
+    .hint { color: #444; margin-top: 0; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 6px 0; }
+    label { min-width: 170px; }
+    input, select, textarea, button { font-size: 14px; padding: 6px; }
+    textarea { width: 100%; min-height: 120px; font-family: monospace; }
+    pre { background: #111; color: #f4f4f4; padding: 10px; border-radius: 6px; overflow: auto; min-height: 180px; }
+  </style>
+</head>
+<body>
+  <h1>neo-infer Console</h1>
+  <p class="hint">A lightweight browser console for common APIs.</p>
+
+  <div class="card">
+    <div class="row">
+      <label>API Base URL</label>
+      <input id="baseUrl" type="text" value="" style="min-width: 360px" />
+      <button onclick="health()">Health</button>
+      <button onclick="listRules()">List Rules</button>
+      <button onclick="listConflicts()">Conflict Cases</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Mine Rules</h3>
+    <div class="row"><label>Body Length</label><select id="mineBodyLength"><option value="2">2</option><option value="3">3</option></select></div>
+    <div class="row"><label>Limit</label><input id="mineLimit" type="number" value="200" /></div>
+    <div class="row"><label>Min Support</label><input id="mineSupport" type="number" value="1" /></div>
+    <div class="row"><label>Min PCA Confidence</label><input id="minePca" type="number" step="0.01" value="0.1" /></div>
+    <div class="row"><button onclick="mineRules()">Run /rules/mine</button></div>
+  </div>
+
+  <div class="card">
+    <h3>Inference</h3>
+    <div class="row"><label>Limit Rules</label><input id="inferLimitRules" type="number" value="100" /></div>
+    <div class="row"><label>Fixpoint</label><select id="inferFixpoint"><option value="false">false</option><option value="true">true</option></select></div>
+    <div class="row"><label>Max Iterations</label><input id="inferMaxIter" type="number" value="5" /></div>
+    <div class="row"><label>Check Conflicts</label><select id="inferConflicts"><option value="true">true</option><option value="false">false</option></select></div>
+    <div class="row"><button onclick="runInference()">Run /inference/run</button></div>
+  </div>
+
+  <div class="card">
+    <h3>Append Changes</h3>
+    <p class="hint">One edge per line: src,rel,dst</p>
+    <div class="row"><label>Added Edges</label></div>
+    <textarea id="addedEdges">u1,bornIn,u2
+u2,locatedIn,u3</textarea>
+    <div class="row"><label>Removed Edges</label></div>
+    <textarea id="removedEdges"></textarea>
+    <div class="row"><button onclick="appendChanges()">Run /changes/append</button></div>
+  </div>
+
+  <div class="card">
+    <h3>Incremental Consume</h3>
+    <div class="row"><label>Body Length</label><select id="incBodyLength"><option value="2">2</option><option value="3">3</option></select></div>
+    <div class="row"><label>Limit</label><input id="incLimit" type="number" value="100" /></div>
+    <div class="row"><label>Change Limit</label><input id="incChangeLimit" type="number" value="1000" /></div>
+    <div class="row"><label>Min Support</label><input id="incSupport" type="number" value="1" /></div>
+    <div class="row"><label>Min PCA Confidence</label><input id="incPca" type="number" step="0.01" value="0.1" /></div>
+    <div class="row"><button onclick="consumeIncremental()">Run /rules/mine/incremental/from-changelog</button></div>
+  </div>
+
+  <div class="card">
+    <h3>Output</h3>
+    <pre id="output"></pre>
+  </div>
+
+<script>
+  function getBase() {
+    const base = document.getElementById("baseUrl").value.trim();
+    return base || window.location.origin;
+  }
+  function setOutput(data) {
+    document.getElementById("output").textContent = JSON.stringify(data, null, 2);
+  }
+  function parseEdges(text) {
+    const out = [];
+    const lines = text.split("\\n").map(v => v.trim()).filter(v => v.length > 0);
+    for (const line of lines) {
+      const parts = line.split(",").map(v => v.trim());
+      if (parts.length !== 3 || !parts[0] || !parts[1] || !parts[2]) {
+        throw new Error("Invalid edge line: " + line + " (expected src,rel,dst)");
+      }
+      out.push({src: parts[0], rel: parts[1], dst: parts[2]});
+    }
+    return out;
+  }
+  async function api(method, path, payload) {
+    const resp = await fetch(getBase() + path, {
+      method,
+      headers: {"Content-Type": "application/json"},
+      body: payload ? JSON.stringify(payload) : undefined
+    });
+    const txt = await resp.text();
+    let data = txt;
+    try { data = txt ? JSON.parse(txt) : {}; } catch (_) {}
+    setOutput({status: resp.status, ok: resp.ok, path, data});
+  }
+  async function health() { await api("GET", "/health"); }
+  async function listRules() { await api("GET", "/rules?limit=100"); }
+  async function listConflicts() { await api("GET", "/conflicts/cases?limit=50"); }
+  async function mineRules() {
+    await api("POST", "/rules/mine", {
+      body_length: Number(document.getElementById("mineBodyLength").value),
+      limit: Number(document.getElementById("mineLimit").value),
+      min_support: Number(document.getElementById("mineSupport").value),
+      min_pca_confidence: Number(document.getElementById("minePca").value)
+    });
+  }
+  async function runInference() {
+    await api("POST", "/inference/run", {
+      limit_rules: Number(document.getElementById("inferLimitRules").value),
+      fixpoint: document.getElementById("inferFixpoint").value === "true",
+      max_iterations: Number(document.getElementById("inferMaxIter").value),
+      check_conflicts: document.getElementById("inferConflicts").value === "true"
+    });
+  }
+  async function appendChanges() {
+    const added = parseEdges(document.getElementById("addedEdges").value);
+    const removed = parseEdges(document.getElementById("removedEdges").value);
+    await api("POST", "/changes/append", {added_edges: added, removed_edges: removed});
+  }
+  async function consumeIncremental() {
+    await api("POST", "/rules/mine/incremental/from-changelog", {
+      body_length: Number(document.getElementById("incBodyLength").value),
+      limit: Number(document.getElementById("incLimit").value),
+      change_limit: Number(document.getElementById("incChangeLimit").value),
+      min_support: Number(document.getElementById("incSupport").value),
+      min_pca_confidence: Number(document.getElementById("incPca").value)
+    });
+  }
+  document.getElementById("baseUrl").value = window.location.origin;
+</script>
+</body>
+</html>
+"""
 
 
 def _trigger_manager(db: Neo4jClient, settings: Settings) -> TriggerManager:
@@ -137,6 +284,11 @@ def get_db(settings: Settings = Depends(get_settings)) -> Neo4jClient:
 @app.get("/health")
 def health(settings: Settings = Depends(get_settings)) -> dict[str, str]:
     return {"status": "ok", "db": settings.neo4j_uri}
+
+
+@app.get("/console", response_class=HTMLResponse)
+def web_console() -> str:
+    return CONSOLE_HTML
 
 
 @app.on_event("startup")
