@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from fastapi import Depends, FastAPI, HTTPException
 
 from neo_infer.config import Settings, get_settings, parse_conflict_relation_pairs
@@ -270,12 +272,24 @@ def install_changelog_trigger(
     if not installed:
         diagnostic = manager.diagnose_install()
         raise HTTPException(status_code=500, detail={"message": "failed to install APOC trigger", "diagnostic": diagnostic})
-    listed = manager.list_triggers()
-    if not any(str(item.get("name", "")) == settings.changelog_trigger_name for item in listed):
+    listed = []
+    found = False
+    # APOC trigger registration can be eventually visible.
+    for _ in range(10):
+        listed = manager.list_triggers()
+        if any(str(item.get("name", "")) == settings.changelog_trigger_name for item in listed):
+            found = True
+            break
+        time.sleep(0.2)
+    if not found:
         diagnostic = manager.diagnose_install()
         raise HTTPException(
             status_code=500,
-            detail={"message": "trigger install reported success but was not listed", "diagnostic": diagnostic},
+            detail={
+                "message": "trigger install reported success but was not listed",
+                "diagnostic": diagnostic,
+                "list_snapshot": listed,
+            },
         )
     return {"status": "installed", "name": settings.changelog_trigger_name}
 

@@ -145,6 +145,7 @@ class TriggerManager:
             "trigger_name": self._trigger_name,
             "apoc_available": False,
             "install_attempt": None,
+            "install_rows": [],
             "install_error": None,
             "list_error": None,
             "list_names": [],
@@ -157,7 +158,7 @@ class TriggerManager:
         self.drop_trigger()
         try:
             diagnostic["install_attempt"] = "install"
-            self._db.run_write(
+            rows = self._db.run_write(
                 """
                 CALL apoc.trigger.install($database, $name, $statement, {}, {phase: "afterAsync"})
                 """,
@@ -168,11 +169,12 @@ class TriggerManager:
                 },
                 database="system",
             )
+            diagnostic["install_rows"] = rows
         except Exception as exc:
             diagnostic["install_error"] = f"install:{type(exc).__name__}:{exc}"
             try:
                 diagnostic["install_attempt"] = "add"
-                self._db.run_write(
+                rows = self._db.run_write(
                     """
                     CALL apoc.trigger.add($name, $statement, {}, {phase: "afterAsync"})
                     """,
@@ -182,6 +184,7 @@ class TriggerManager:
                     },
                     database="system",
                 )
+                diagnostic["install_rows"] = rows
             except Exception as exc2:
                 diagnostic["install_error"] = (
                     f"{diagnostic['install_error']} | add:{type(exc2).__name__}:{exc2}"
@@ -195,16 +198,24 @@ class TriggerManager:
         return diagnostic
 
     def list_triggers(self) -> list[dict[str, object]]:
-        try:
-            rows = self._db.run_read("CALL apoc.trigger.list()")
-            return rows
-        except Exception:
-            pass
-        try:
-            rows = self._db.run_read("CALL apoc.trigger.list()", database="system")
-            return rows
-        except Exception:
-            return []
+        rows: list[dict[str, object]] = []
+        seen: set[tuple[str, str]] = set()
+
+        for db_name in (self._db.settings.neo4j_database, "system"):
+            try:
+                current = self._db.run_read("CALL apoc.trigger.list()", database=db_name)
+            except Exception:
+                continue
+            for item in current:
+                name = str(item.get("name", ""))
+                key = (db_name, name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                enriched = dict(item)
+                enriched["_db"] = db_name
+                rows.append(enriched)
+        return rows
 
     def drop_trigger(self) -> bool:
         # Neo4j 5+ APOC style.
