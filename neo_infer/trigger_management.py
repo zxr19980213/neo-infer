@@ -13,6 +13,18 @@ class TriggerManager:
         self._db = db
         self._trigger_name = trigger_name.strip() if trigger_name and trigger_name.strip() else self.TRIGGER_NAME
 
+    def _probe_apoc_trigger(self, database: str | None = None) -> bool:
+        try:
+            self._db.run_read("CALL apoc.help('trigger')", database=database)
+            return True
+        except Exception:
+            pass
+        try:
+            self._db.run_read("CALL apoc.trigger.list()", database=database)
+            return True
+        except Exception:
+            return False
+
     def ensure_trigger(self, *, enabled: bool) -> bool:
         if not enabled:
             self.drop_trigger()
@@ -21,11 +33,10 @@ class TriggerManager:
 
     def ensure_config_enabled(self) -> bool:
         """Best-effort check for APOC trigger availability."""
-        try:
-            self._db.run_read("CALL apoc.help('trigger')", database="system")
-            return True
-        except Exception:
-            return False
+        # Some Neo4j/APOC distributions expose procedures differently between
+        # the user database and the system database. Probe both to avoid
+        # false negatives.
+        return self._probe_apoc_trigger(None) or self._probe_apoc_trigger("system")
 
     def _trigger_statement(self) -> str:
         labels = ",".join(f'"{item}"' for item in self.INTERNAL_LABELS)
