@@ -43,17 +43,24 @@ class TriggerManager:
         # Uses apoc.trigger.install and tx metadata guard:
         # - Skip system writes tagged by app (skip_changelog=true).
         # - Skip writes touching ChangeLog / internal state labels to avoid self-loop.
+        # NOTE:
+        # - For deleted relationships we must materialize virtual relationships via
+        #   apoc.trigger.toRelationship(..., $removedRelationshipProperties).
+        #   Otherwise, calls like startNode(rel)/endNode(rel) may fail in DETACH DELETE
+        #   transactions with "node has been deleted in this transaction".
         return f"""
         WITH $createdRelationships AS createdRels,
              $deletedRelationships AS deletedRels,
+             coalesce($removedRelationshipProperties,{{}}) AS removedRelProps,
+             coalesce($transactionId, -1) AS txId,
              coalesce($metaData,{{}}) AS meta
         WHERE coalesce(meta.skip_changelog, false) = false
         WITH [rel IN createdRels
               WHERE NOT any(lbl IN labels(startNode(rel)) WHERE lbl IN [{labels}])
                 AND NOT any(lbl IN labels(endNode(rel)) WHERE lbl IN [{labels}])] AS createdFiltered,
-             [rel IN deletedRels
-              WHERE NOT any(lbl IN labels(startNode(rel)) WHERE lbl IN [{labels}])
-                AND NOT any(lbl IN labels(endNode(rel)) WHERE lbl IN [{labels}])] AS deletedFiltered
+             deletedRels,
+             removedRelProps,
+             txId
         CALL {{
           WITH createdFiltered
           UNWIND createdFiltered AS rel
@@ -69,13 +76,23 @@ class TriggerManager:
           RETURN count(*) AS created_count
         }}
         CALL {{
-          WITH deletedFiltered
-          UNWIND deletedFiltered AS rel
-          MERGE (c:ChangeLog {{dedup_key: "trigger|del|" + elementId(rel)}})
+          WITH deletedRels, removedRelProps, txId
+          UNWIND deletedRels AS relRaw
+          WITH apoc.trigger.toRelationship(relRaw, removedRelProps) AS rel, txId
+          WITH rel, apoc.rel.startNode(rel) AS s, apoc.rel.endNode(rel) AS t, txId
+          WHERE s IS NOT NULL AND t IS NOT NULL
+            AND NOT any(lbl IN labels(s) WHERE lbl IN [{labels}])
+            AND NOT any(lbl IN labels(t) WHERE lbl IN [{labels}])
+          WITH rel, s, t, txId,
+               coalesce(toString(s.id), "deleted:start") AS srcId,
+               coalesce(toString(t.id), "deleted:end") AS dstId
+          MERGE (c:ChangeLog {{
+            dedup_key: "trigger|del|" + coalesce(elementId(rel), srcId + "|" + type(rel) + "|" + dstId + "|" + toString(txId))
+          }})
           ON CREATE SET c.event_type = "removed",
-                        c.src = coalesce(startNode(rel).id, elementId(startNode(rel))),
+                        c.src = srcId,
                         c.rel = type(rel),
-                        c.dst = coalesce(endNode(rel).id, elementId(endNode(rel))),
+                        c.dst = dstId,
                         c.source = "trigger",
                         c.batch_id = "trigger",
                         c.idempotency_key = "trigger",
