@@ -440,6 +440,7 @@ def mine_rules(
         beam_width=payload.beam_width,
         head_budget_per_relation=payload.head_budget_per_relation,
         confidence_ub_weight=payload.confidence_ub_weight,
+        body_length=payload.body_length,
     )
     discovered = miner.mine_rules(config)
     store = RuleStore(db)

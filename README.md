@@ -3,9 +3,10 @@
 知识图谱规则挖掘与推理服务（MVP）。
 
 ## 当前实现范围
-- 规则挖掘：长度为 2/3 的路径规则  
-  - `r1(X,Z) ∧ r2(Z,Y) -> r3(X,Y)`
-  - `r1(X,A) ∧ r2(A,B) ∧ r3(B,Y) -> r4(X,Y)`
+- 规则挖掘：长度为 2~5 的路径规则  
+  - 长度 2: `r1(X,Z) ∧ r2(Z,Y) -> r3(X,Y)`
+  - 长度 3: `r1(X,A) ∧ r2(A,B) ∧ r3(B,Y) -> r4(X,Y)`
+  - 长度 4~5: 通用动态 Cypher 生成（如 `r1(X,Z1) ∧ r2(Z1,Z2) ∧ r3(Z2,Z3) ∧ r4(Z3,Y) -> r5(X,Y)`）
 - 指标：`support`、`pca_confidence`、`head_coverage`
 - AMIE+ 搜索骨架与剪枝（已接入）：
   - dangling -> closing 分层搜索
@@ -390,6 +391,9 @@ python scripts/bench_index_strategies.py \
 - `DELETE /triggers/changelog`（卸载 DB Trigger）
 
 ### 挖掘参数说明（关键）
+- `body_length`（默认 `2`，范围 `2~5`）：
+  - 规则体中关系的跳数。长度 2/3 使用优化的 Cypher 查询；长度 4/5 使用通用动态生成路径。
+  - 长度越大搜索空间指数增长，建议配合 `candidate_limit` 控制。
 - `factual_only`（默认 `true`）：
   - 当为 `true` 时，规则挖掘相关统计（body 候选、support、PCA 分母、head 计数）仅使用事实边（`is_inferred != true`）。
   - 用于避免 benchmark 被历史推理边污染，建议保持默认值。
