@@ -19,6 +19,16 @@ class TriggerManager:
             return True
         except Exception:
             pass
+        # Neo4j 5.x: apoc.trigger.show requires system db.
+        try:
+            self._db.run_read(
+                "CALL apoc.trigger.show($database)",
+                {"database": self._db.settings.neo4j_database},
+                database="system",
+            )
+            return True
+        except Exception:
+            pass
         try:
             self._db.run_read("CALL apoc.trigger.list()", database=database)
             return True
@@ -198,6 +208,26 @@ class TriggerManager:
         rows: list[dict[str, object]] = []
         seen: set[tuple[str, str]] = set()
 
+        # Neo4j 5.x: apoc.trigger.show($database) on system db.
+        try:
+            current = self._db.run_read(
+                "CALL apoc.trigger.show($database)",
+                {"database": self._db.settings.neo4j_database},
+                database="system",
+            )
+            for item in current:
+                name = str(item.get("name", ""))
+                key = ("system", name)
+                if key not in seen:
+                    seen.add(key)
+                    enriched = dict(item)
+                    enriched["_db"] = "system"
+                    rows.append(enriched)
+            return rows
+        except Exception:
+            pass
+
+        # Neo4j 4.x fallback: apoc.trigger.list() per database.
         for db_name in (self._db.settings.neo4j_database, "system"):
             try:
                 current = self._db.run_read("CALL apoc.trigger.list()", database=db_name)
