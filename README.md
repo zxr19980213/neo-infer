@@ -11,24 +11,34 @@
   - dangling -> closing 分层搜索
   - canonical 去重、support/no-gain 剪枝、confidence upper-bound 预剪枝
   - `beam_width`（层级 Top-B）与 `head_budget_per_relation`（按 head 配额）
-- 规则管理：`discovered / adopted / applied / rejected`
-- 规则应用：已采纳规则单轮推理，写入 `is_inferred=true` 的关系
+- 规则管理：`discovered / adopted / applied / rejected`，带状态机校验
+- 规则应用：已采纳规则单轮/fixpoint 推理，写入 `is_inferred=true` 的关系
 - 冲突管理：数据库持久化冲突规则 + 冲突实例落库（`ConflictCase`）
 - 增量挖掘：`ChangeLog(change_seq)` 驱动，支持 from-changelog 非空/混合 add-remove/幂等消费
+- Web 控制台：轻量浏览器界面，包含规则挖掘/管理/推理/增量消费全流程操作
+- Trigger 管理：兼容 Neo4j 5.x（`apoc.trigger.install/show/drop`）与 4.x（`apoc.trigger.add/list/remove`）
 
 ## 项目结构
 ```text
 neo_infer/
-  config.py          # 运行配置
-  models.py          # Pydantic 数据模型
-  db.py              # Neo4j 连接与执行
-  query.py           # Cypher 查询模板
-  rule_mining.py     # 挖掘服务
-  rule_management.py # 规则管理服务
-  inference.py       # 推理引擎
-  api.py             # FastAPI 路由
-main.py              # 应用入口
-PLAN                 # 总体实施计划
+  config.py              # 运行配置
+  models.py              # Pydantic 数据模型
+  db.py                  # Neo4j 连接与执行
+  query.py               # Cypher 查询模板
+  rule_mining.py         # 挖掘服务（AMIE+ 搜索框架）
+  rule_management.py     # 规则管理服务（含状态机校验）
+  inference.py           # 推理引擎（单轮 + fixpoint）
+  conflict_management.py # 冲突规则与实例管理
+  incremental_mining.py  # 增量挖掘服务
+  incremental_store.py   # ChangeLog / 游标 / RuleStat 持久层
+  trigger_management.py  # APOC Trigger 生命周期管理
+  cli.py                 # 命令行工具
+  api.py                 # FastAPI 路由 + Web 控制台
+main.py                  # 应用入口
+tests/                   # pytest smoke tests（35 个用例）
+scripts/                 # 压测与 schema 工具脚本
+PLAN                     # 总体实施计划
+AGENTS.md                # Cloud Agent 开发环境说明
 ```
 
 ## 环境变量
@@ -64,6 +74,9 @@ PLAN                 # 总体实施计划
 ```cypher
 RETURN apoc.version();
 CALL apoc.help("trigger");
+-- Neo4j 5.x:
+CALL apoc.trigger.show('neo4j');
+-- Neo4j 4.x:
 CALL apoc.trigger.list();
 ```
 
@@ -78,8 +91,9 @@ CALL apoc.trigger.list();
 ### 6) 常见问题
 - 若安装时报 `No write operations are allowed ... FOLLOWER`：
   - 通常是连接到了不可写节点；单机请确认 `NEO4J_URI` 指向本机可写 bolt 端点（如 `bolt://127.0.0.1:7687`）。
-- 若 API 返回“installed”但 `apoc.trigger.list()` 为空：
-  - 先重试安装接口；当前服务会跨库检查并带诊断信息返回。
+- 若 API 返回“installed”但查询不到 trigger：
+  - Neo4j 5.x 请用 `CALL apoc.trigger.show('neo4j')` 在 system 库查询（非 `apoc.trigger.list()`）。
+  - 当前服务已自动适配 5.x/4.x 两种查询 API。
 
 ## 运行
 ```bash
@@ -114,9 +128,31 @@ http://127.0.0.1:8000/console
 控制台提供常用操作按钮与参数输入：
 - Health / 规则列表 / 冲突实例查询
 - 规则挖掘（`/rules/mine`）
+- **规则管理**（Rules Management）：规则表格 + 状态筛选 + 每条规则的 Adopt/Reject 按钮 + Adopt All 批量操作
 - 推理执行（`/inference/run`）
 - 变更追加（`/changes/append`）
 - 增量消费（`/rules/mine/incremental/from-changelog`）
+
+## 规则状态机
+规则状态转换由服务端强制校验，非法转换返回 `409 Conflict`。
+
+```text
+discovered --[adopt]--> adopted --[inference]--> applied (终态)
+discovered --[reject]--> rejected (终态)
+adopted    --[reject]--> rejected (终态)
+```
+
+- `adopt`：仅接受 `discovered` 状态
+- `reject`：接受 `discovered` 或 `adopted` 状态
+- `applied`：仅由推理引擎内部设置（`created_triples > 0` 时自动转换），终态
+- `rejected`：终态，不可再转换
+
+| 当前状态 | adopt | reject | inference |
+|---------|-------|--------|-----------|
+| discovered | adopted | rejected | - |
+| adopted | 409 | rejected | applied |
+| applied | 409 | 409 | - |
+| rejected | 409 | 409 | - |
 
 ## 本地 Neo4j 完整测试流程（不含 Docker）
 以下流程假设你已在本地启动并可访问 Neo4j。
@@ -179,6 +215,9 @@ curl -X POST "http://127.0.0.1:8000/inference/run" \
   -d '{"limit_rules":100,"fixpoint":false,"max_iterations":5,"check_conflicts":false}'
 ```
 
+> **注意**：`adopt`/`reject` 接口带状态机校验。规则不存在返回 `404`，非法转换返回 `409`。
+> 合法转换路径见下方"规则状态机"一节。
+
 ### 6) 冲突链路验证（含冲突实例）
 ```bash
 curl -X PUT "http://127.0.0.1:8000/conflicts" \
@@ -238,14 +277,15 @@ curl -X POST "http://127.0.0.1:8000/rules/mine/incremental/from-changelog" \
 ```
 
 ## 自动化稳定性测试（Smoke）
-新增了 API 全链路 smoke tests，覆盖：
+API 全链路 smoke tests（35 个用例），覆盖：
 - `rules mine`（长度2/长度3/增量）
 - `inference`（单轮/fixpoint）
 - `conflicts`（增删改查 + case 查询）
+- **规则状态转换**（10 个用例：合法路径、非法转换 409、不存在 404）
 
 运行命令：
 ```bash
-pip install pytest
+pip install -e ".[dev]"
 pytest -q
 ```
 

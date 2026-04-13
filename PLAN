@@ -84,11 +84,16 @@ Neo4j 图数据库
 - `rule_id`
 - 规则体文本表示
 - `support / confidence / head_coverage`
-- `status`: discovered → adopted → applied / rejected
+- `status`: discovered → adopted → applied / rejected（带状态机校验）
 - `version`（图更新后重算管理）
 
+状态转换规则（已实现服务端强制校验）：
+- `discovered` → `adopted` | `rejected`
+- `adopted` → `rejected` | `applied`（`applied` 仅由推理引擎设置）
+- `applied` / `rejected` 为终态
+
 存储位置：
-- 优先 Neo4j 专用节点；或独立 SQLite（规则量通常较小）。
+- Neo4j 专用 `Rule` 节点。
 
 ## 模块 4：前向链推理（规则应用）
 对已采纳规则 `body1 ∧ body2 → head`：
@@ -108,12 +113,12 @@ Neo4j 图数据库
 ---
 
 ## 5. 技术栈建议
-- 图数据库：Neo4j 4.4+
+- 图数据库：Neo4j 5.x（向下兼容 4.x）
 - 挖掘引擎：Python + neo4j driver（可快速迭代）
 - 并行：multiprocessing / Ray
-- 规则存储：Neo4j 内规则节点 或 SQLite
+- 规则存储：Neo4j 内规则节点
 - API：FastAPI（暴露挖掘/采纳/推理接口）
-- 前端（可选）：Neo4j Browser 插件或独立 Web UI
+- 前端：内置轻量 Web 控制台（`/console`）
 
 ---
 
@@ -201,6 +206,18 @@ Neo4j 图数据库
   - 大数据生成脚本：`scripts/bench_seed_large.py`
   - 端到端基准脚本：`scripts/bench_api_perf.py`
   - 索引策略对比：`scripts/bench_index_strategies.py`
+- **规则状态机强制校验**：
+  - `adopt`/`reject` API 端点增加状态转换校验，非法转换返回 409；
+  - 规则不存在返回 404（而非之前的 200 + `not_found`）；
+  - `applied`/`rejected` 为终态，不可再转换。
+- **Trigger 管理 Neo4j 5.x 兼容**：
+  - `list_triggers()` 和 `_probe_apoc_trigger()` 优先使用 `apoc.trigger.show($database)`；
+  - 回退到 `apoc.trigger.list()` 兼容 4.x。
+- **Web 控制台增强**：
+  - 新增 Rules Management 面板：规则表格 + 状态筛选 + Adopt/Reject 按钮 + Adopt All；
+  - 状态徽章颜色编码，按钮按状态机规则自动禁用。
+- **自动化测试**：
+  - 35 个 pytest smoke tests（含 10 个状态转换覆盖用例）。
 
 ### 部分完成（可用但仍可深化）
 - **真增量计数**：已实现受影响规则增量更新闭环；事件级 +1/-1 原子计数（尽量免重算）仍可继续深化。
@@ -233,8 +250,13 @@ Neo4j 图数据库
    - 慢查询采样、关键路径埋点（挖掘/推理/增量）。
 3) 压测报告自动聚合：
    - 统一生成策略对比与回归阈值告警。
+4) 增量挖掘 `factual_only` 一致性：
+   - `_update_existing_rules_by_delta` 需透传 `factual_only` 参数。
+5) 并发安全加固：
+   - `IdSequence` / `ChangeLog.change_seq` 并发写入竞争。
+   - 推理 `NOT EXISTS` + `MERGE` 并发重复边。
 
 ### P2（能力扩展）
 1) AnyBURL 路径试验与效果评估。
 2) 规则质量评估体系（precision/recall）产品化。
-3) 可视化审核/运营工具（可选）。
+3) Web 控制台进一步增强（可选）。
