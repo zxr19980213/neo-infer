@@ -5,6 +5,23 @@ from typing import Iterable
 from neo_infer.db import Neo4jClient
 from neo_infer.models import Rule
 
+VALID_TRANSITIONS: dict[str, set[str]] = {
+    "discovered": {"adopted", "rejected"},
+    "adopted": {"rejected", "applied"},
+    "applied": set(),
+    "rejected": set(),
+}
+
+
+class InvalidStatusTransition(Exception):
+    def __init__(self, rule_id: str, current: str, target: str) -> None:
+        self.rule_id = rule_id
+        self.current = current
+        self.target = target
+        super().__init__(
+            f"Cannot transition rule '{rule_id}' from '{current}' to '{target}'"
+        )
+
 
 class RuleStore:
     def __init__(self, client: Neo4jClient) -> None:
@@ -81,7 +98,39 @@ class RuleStore:
             )
         return result
 
+    def get_rule_status(self, rule_id: str) -> str | None:
+        rows = self._client.run_read(
+            """
+            MATCH (r:Rule {rule_id: $rule_id})
+            RETURN r.status AS status
+            """,
+            {"rule_id": rule_id},
+        )
+        if not rows:
+            return None
+        return str(rows[0].get("status", "discovered"))
+
+    def transition_rule_status(self, rule_id: str, target: str) -> str:
+        """Transition rule status with validation.
+
+        Returns the new status on success.
+        Raises KeyError if rule not found.
+        Raises InvalidStatusTransition if the transition is not allowed.
+        """
+        current = self.get_rule_status(rule_id)
+        if current is None:
+            raise KeyError(rule_id)
+        allowed = VALID_TRANSITIONS.get(current, set())
+        if target not in allowed:
+            raise InvalidStatusTransition(rule_id, current, target)
+        self._set_rule_status(rule_id, target)
+        return target
+
     def update_rule_status(self, rule_id: str, status: str) -> bool:
+        """Set rule status unconditionally (used by inference engine)."""
+        return self._set_rule_status(rule_id, status)
+
+    def _set_rule_status(self, rule_id: str, status: str) -> bool:
         rows = self._client.run_write(
             """
             MATCH (r:Rule {rule_id: $rule_id})

@@ -7,6 +7,7 @@ import pytest
 
 import neo_infer.api as api_module
 from neo_infer.models import ChangeEdge, ConflictCase, DeltaBatch, Rule
+from neo_infer.rule_management import VALID_TRANSITIONS, InvalidStatusTransition
 
 
 @pytest.fixture()
@@ -196,6 +197,22 @@ def client_and_state(monkeypatch: pytest.MonkeyPatch):
             if status is not None:
                 rules = [item for item in rules if item.status == status]
             return rules[:limit]
+
+        def get_rule_status(self, rule_id: str) -> str | None:
+            rule = state["rules"].get(rule_id)
+            if rule is None:
+                return None
+            return rule.status
+
+        def transition_rule_status(self, rule_id: str, target: str) -> str:
+            current = self.get_rule_status(rule_id)
+            if current is None:
+                raise KeyError(rule_id)
+            allowed = VALID_TRANSITIONS.get(current, set())
+            if target not in allowed:
+                raise InvalidStatusTransition(rule_id, current, target)
+            state["rules"][rule_id] = state["rules"][rule_id].model_copy(update={"status": target})
+            return target
 
         def update_rule_status(self, rule_id: str, status: str) -> bool:
             rule = state["rules"].get(rule_id)
@@ -768,4 +785,141 @@ def test_console_page_smoke(client_and_state):
     assert resp.status_code == 200
     assert "neo-infer Console" in resp.text
     assert "/rules/mine" in resp.text
+
+
+def test_adopt_nonexistent_rule_returns_404(client_and_state):
+    client, _state = client_and_state
+    resp = client.post("/rules/nonexistent_rule_id/adopt")
+    assert resp.status_code == 404
+
+
+def test_reject_nonexistent_rule_returns_404(client_and_state):
+    client, _state = client_and_state
+    resp = client.post("/rules/nonexistent_rule_id/reject")
+    assert resp.status_code == 404
+
+
+def test_adopt_discovered_succeeds(client_and_state):
+    client, _state = client_and_state
+    client.post(
+        "/rules/mine",
+        json={"body_length": 2, "limit": 10, "min_support": 1, "min_pca_confidence": 0.1},
+    )
+    rule_id = list(_state["rules"].keys())[0]
+    assert _state["rules"][rule_id].status == "discovered"
+
+    resp = client.post(f"/rules/{rule_id}/adopt")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "adopted"
+
+
+def test_adopt_already_adopted_returns_409(client_and_state):
+    client, _state = client_and_state
+    client.post(
+        "/rules/mine",
+        json={"body_length": 2, "limit": 10, "min_support": 1, "min_pca_confidence": 0.1},
+    )
+    rule_id = list(_state["rules"].keys())[0]
+    client.post(f"/rules/{rule_id}/adopt")
+    assert _state["rules"][rule_id].status == "adopted"
+
+    resp = client.post(f"/rules/{rule_id}/adopt")
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["current_status"] == "adopted"
+    assert detail["target_status"] == "adopted"
+
+
+def test_adopt_applied_returns_409(client_and_state):
+    client, state = client_and_state
+    client.post(
+        "/rules/mine",
+        json={"body_length": 2, "limit": 10, "min_support": 1, "min_pca_confidence": 0.1},
+    )
+    rule_id = list(state["rules"].keys())[0]
+    client.post(f"/rules/{rule_id}/adopt")
+
+    infer_resp = client.post(
+        "/inference/run",
+        json={"limit_rules": 10, "fixpoint": False, "check_conflicts": False},
+    )
+    assert infer_resp.status_code == 200
+
+    resp = client.post(f"/rules/{rule_id}/adopt")
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["current_status"] == "applied"
+
+
+def test_adopt_rejected_returns_409(client_and_state):
+    client, _state = client_and_state
+    client.post(
+        "/rules/mine",
+        json={"body_length": 2, "limit": 10, "min_support": 1, "min_pca_confidence": 0.1},
+    )
+    rule_id = list(_state["rules"].keys())[0]
+    client.post(f"/rules/{rule_id}/reject")
+    assert _state["rules"][rule_id].status == "rejected"
+
+    resp = client.post(f"/rules/{rule_id}/adopt")
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["current_status"] == "rejected"
+
+
+def test_reject_discovered_succeeds(client_and_state):
+    client, _state = client_and_state
+    client.post(
+        "/rules/mine",
+        json={"body_length": 2, "limit": 10, "min_support": 1, "min_pca_confidence": 0.1},
+    )
+    rule_id = list(_state["rules"].keys())[0]
+
+    resp = client.post(f"/rules/{rule_id}/reject")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "rejected"
+
+
+def test_reject_adopted_succeeds(client_and_state):
+    client, _state = client_and_state
+    client.post(
+        "/rules/mine",
+        json={"body_length": 2, "limit": 10, "min_support": 1, "min_pca_confidence": 0.1},
+    )
+    rule_id = list(_state["rules"].keys())[0]
+    client.post(f"/rules/{rule_id}/adopt")
+
+    resp = client.post(f"/rules/{rule_id}/reject")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "rejected"
+
+
+def test_reject_applied_returns_409(client_and_state):
+    client, state = client_and_state
+    client.post(
+        "/rules/mine",
+        json={"body_length": 2, "limit": 10, "min_support": 1, "min_pca_confidence": 0.1},
+    )
+    rule_id = list(state["rules"].keys())[0]
+    client.post(f"/rules/{rule_id}/adopt")
+    client.post(
+        "/inference/run",
+        json={"limit_rules": 10, "fixpoint": False, "check_conflicts": False},
+    )
+
+    resp = client.post(f"/rules/{rule_id}/reject")
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["current_status"] == "applied"
+
+
+def test_reject_already_rejected_returns_409(client_and_state):
+    client, _state = client_and_state
+    client.post(
+        "/rules/mine",
+        json={"body_length": 2, "limit": 10, "min_support": 1, "min_pca_confidence": 0.1},
+    )
+    rule_id = list(_state["rules"].keys())[0]
+    client.post(f"/rules/{rule_id}/reject")
+
+    resp = client.post(f"/rules/{rule_id}/reject")
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["current_status"] == "rejected"
 
