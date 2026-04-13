@@ -51,6 +51,22 @@ CONSOLE_HTML = """<!doctype html>
     input, select, textarea, button { font-size: 14px; padding: 6px; }
     textarea { width: 100%; min-height: 120px; font-family: monospace; }
     pre { background: #111; color: #f4f4f4; padding: 10px; border-radius: 6px; overflow: auto; min-height: 180px; }
+    #rulesTable { width: 100%; border-collapse: collapse; font-size: 13px; }
+    #rulesTable th, #rulesTable td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; }
+    #rulesTable th { background: #f5f5f5; }
+    #rulesTable tr:hover { background: #f9f9f9; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; color: #fff; }
+    .badge-discovered { background: #2196f3; }
+    .badge-adopted { background: #4caf50; }
+    .badge-applied { background: #009688; }
+    .badge-rejected { background: #f44336; }
+    .btn-sm { font-size: 12px; padding: 3px 10px; cursor: pointer; border: 1px solid #ccc; border-radius: 4px; }
+    .btn-adopt { background: #e8f5e9; color: #2e7d32; }
+    .btn-adopt:hover { background: #c8e6c9; }
+    .btn-reject { background: #ffebee; color: #c62828; }
+    .btn-reject:hover { background: #ffcdd2; }
+    .btn-adopt:disabled, .btn-reject:disabled { opacity: 0.4; cursor: default; }
+    #rulesPanel .status-filter { margin-right: 8px; }
   </style>
 </head>
 <body>
@@ -74,6 +90,27 @@ CONSOLE_HTML = """<!doctype html>
     <div class="row"><label>Min Support</label><input id="mineSupport" type="number" value="1" /></div>
     <div class="row"><label>Min PCA Confidence</label><input id="minePca" type="number" step="0.01" value="0.1" /></div>
     <div class="row"><button onclick="mineRules()">Run /rules/mine</button></div>
+  </div>
+
+  <div class="card" id="rulesPanel">
+    <h3>Rules Management</h3>
+    <div class="row">
+      <label>Status Filter</label>
+      <select id="rulesStatusFilter" class="status-filter">
+        <option value="">All</option>
+        <option value="discovered" selected>discovered</option>
+        <option value="adopted">adopted</option>
+        <option value="applied">applied</option>
+        <option value="rejected">rejected</option>
+      </select>
+      <label>Limit</label>
+      <input id="rulesLimit" type="number" value="100" style="width:80px" />
+      <button onclick="loadRulesTable()">Refresh</button>
+      <button onclick="adoptAll()">Adopt All Visible</button>
+    </div>
+    <div id="rulesTableWrap" style="max-height:400px;overflow:auto;margin-top:8px;">
+      <p class="hint">Click "Refresh" to load rules.</p>
+    </div>
   </div>
 
   <div class="card">
@@ -175,6 +212,83 @@ u2,locatedIn,u3</textarea>
       min_pca_confidence: Number(document.getElementById("incPca").value)
     });
   }
+  let _rulesCache = [];
+
+  async function loadRulesTable() {
+    const status = document.getElementById("rulesStatusFilter").value;
+    const limit = Number(document.getElementById("rulesLimit").value) || 100;
+    let path = "/rules?limit=" + limit;
+    if (status) path += "&status=" + encodeURIComponent(status);
+    const resp = await fetch(getBase() + path);
+    const body = await resp.json();
+    const rules = body.rules || [];
+    _rulesCache = rules;
+    renderRulesTable(rules);
+  }
+
+  function renderRulesTable(rules) {
+    const wrap = document.getElementById("rulesTableWrap");
+    if (!rules.length) {
+      wrap.innerHTML = '<p class="hint">No rules found.</p>';
+      return;
+    }
+    let html = '<table id="rulesTable"><thead><tr>' +
+      '<th>Rule ID</th><th>Body</th><th>Head</th>' +
+      '<th>Support</th><th>PCA Conf</th><th>Head Cov</th>' +
+      '<th>Status</th><th>Ver</th><th>Actions</th>' +
+      '</tr></thead><tbody>';
+    for (const r of rules) {
+      const bodyStr = (r.body_relations || []).join(' &and; ');
+      const badge = '<span class="badge badge-' + r.status + '">' + r.status + '</span>';
+      const canAdopt = r.status === 'discovered';
+      const canReject = r.status === 'discovered' || r.status === 'adopted';
+      const rid = r.rule_id.replace(/'/g, "\\\\'");
+      html += '<tr id="row-' + r.rule_id + '">' +
+        '<td style="font-size:11px;word-break:break-all">' + r.rule_id + '</td>' +
+        '<td>' + bodyStr + '</td>' +
+        '<td>' + r.head_relation + '</td>' +
+        '<td>' + r.support + '</td>' +
+        '<td>' + (r.pca_confidence != null ? r.pca_confidence.toFixed(3) : '-') + '</td>' +
+        '<td>' + (r.head_coverage != null ? r.head_coverage.toFixed(3) : '-') + '</td>' +
+        '<td>' + badge + '</td>' +
+        '<td>' + (r.version || 1) + '</td>' +
+        '<td style="white-space:nowrap">' +
+          '<button class="btn-sm btn-adopt" onclick="adoptRule(\\'' + rid + '\\')"' +
+            (canAdopt ? '' : ' disabled') + '>Adopt</button> ' +
+          '<button class="btn-sm btn-reject" onclick="rejectRule(\\'' + rid + '\\')"' +
+            (canReject ? '' : ' disabled') + '>Reject</button>' +
+        '</td></tr>';
+    }
+    html += '</tbody></table>';
+    wrap.innerHTML = html;
+  }
+
+  async function adoptRule(ruleId) {
+    const resp = await fetch(getBase() + "/rules/" + encodeURIComponent(ruleId) + "/adopt", {method: "POST"});
+    const data = await resp.json();
+    setOutput({status: resp.status, ok: resp.ok, path: "/rules/" + ruleId + "/adopt", data});
+    await loadRulesTable();
+  }
+
+  async function rejectRule(ruleId) {
+    const resp = await fetch(getBase() + "/rules/" + encodeURIComponent(ruleId) + "/reject", {method: "POST"});
+    const data = await resp.json();
+    setOutput({status: resp.status, ok: resp.ok, path: "/rules/" + ruleId + "/reject", data});
+    await loadRulesTable();
+  }
+
+  async function adoptAll() {
+    const toAdopt = _rulesCache.filter(r => r.status === "discovered");
+    if (!toAdopt.length) { setOutput({message: "No discovered rules to adopt"}); return; }
+    const results = [];
+    for (const r of toAdopt) {
+      const resp = await fetch(getBase() + "/rules/" + encodeURIComponent(r.rule_id) + "/adopt", {method: "POST"});
+      results.push({rule_id: r.rule_id, status: resp.status});
+    }
+    setOutput({action: "adopt_all", results});
+    await loadRulesTable();
+  }
+
   document.getElementById("baseUrl").value = window.location.origin;
 </script>
 </body>
