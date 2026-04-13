@@ -30,7 +30,7 @@ from neo_infer.models import (
     RuleSetResponse,
 )
 from neo_infer.query import QueryRepository
-from neo_infer.rule_management import RuleStore
+from neo_infer.rule_management import InvalidStatusTransition, RuleStore
 from neo_infer.rule_mining import MiningConfig, RuleMiningService
 
 app = FastAPI(title="neo-infer", version="0.1.0")
@@ -240,8 +240,8 @@ u2,locatedIn,u3</textarea>
     for (const r of rules) {
       const bodyStr = (r.body_relations || []).join(' &and; ');
       const badge = '<span class="badge badge-' + r.status + '">' + r.status + '</span>';
-      const canAdopt = r.status === 'discovered';
-      const canReject = r.status === 'discovered' || r.status === 'adopted';
+      const canAdopt = (r.status === 'discovered');
+      const canReject = (r.status === 'discovered' || r.status === 'adopted');
       const rid = r.rule_id.replace(/'/g, "\\\\'");
       html += '<tr id="row-' + r.rule_id + '">' +
         '<td style="font-size:11px;word-break:break-all">' + r.rule_id + '</td>' +
@@ -753,18 +753,40 @@ def list_rules(
 
 @app.post("/rules/{rule_id}/adopt")
 def adopt_rule(rule_id: str, db: Neo4jClient = Depends(get_db)) -> dict[str, str]:
-    updated = RuleStore(db).update_rule_status(rule_id=rule_id, status="adopted")
-    if not updated:
-        return {"status": "not_found", "rule_id": rule_id}
-    return {"status": "adopted", "rule_id": rule_id}
+    try:
+        new_status = RuleStore(db).transition_rule_status(rule_id, "adopted")
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Rule '{rule_id}' not found")
+    except InvalidStatusTransition as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "rule_id": exc.rule_id,
+                "current_status": exc.current,
+                "target_status": exc.target,
+            },
+        )
+    return {"status": new_status, "rule_id": rule_id}
 
 
 @app.post("/rules/{rule_id}/reject")
 def reject_rule(rule_id: str, db: Neo4jClient = Depends(get_db)) -> dict[str, str]:
-    updated = RuleStore(db).update_rule_status(rule_id=rule_id, status="rejected")
-    if not updated:
-        return {"status": "not_found", "rule_id": rule_id}
-    return {"status": "rejected", "rule_id": rule_id}
+    try:
+        new_status = RuleStore(db).transition_rule_status(rule_id, "rejected")
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Rule '{rule_id}' not found")
+    except InvalidStatusTransition as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "rule_id": exc.rule_id,
+                "current_status": exc.current,
+                "target_status": exc.target,
+            },
+        )
+    return {"status": new_status, "rule_id": rule_id}
 
 
 @app.get("/conflicts", response_model=ConflictPairsResponse)
