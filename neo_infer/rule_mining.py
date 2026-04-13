@@ -50,9 +50,13 @@ class RuleMiningService:
                 return self.mine_length3_rules_incremental(config, config.changed_relations)
             return self.mine_length3_rules(config)
 
-        if config.changed_relations:
-            return self.mine_length2_rules_incremental(config, config.changed_relations)
-        return self.mine_length2_rules(config)
+        if config.body_length == 2:
+            if config.changed_relations:
+                return self.mine_length2_rules_incremental(config, config.changed_relations)
+            return self.mine_length2_rules(config)
+
+        # Generic path for body_length > 3
+        return self.mine_lengthN_rules(config)
 
     @staticmethod
     def _to_rules_from_candidates(
@@ -552,6 +556,28 @@ class RuleMiningService:
             factual_only=config.factual_only,
         )
         return self._to_rules_from_candidates(raw_candidates, head_counts, config)
+
+    def mine_lengthN_rules(self, config: MiningConfig) -> list[Rule]:
+        """Mine rules for body length > 3 using generic candidate enumeration."""
+        self._factual_only = bool(config.factual_only)
+        candidates = self._repository.lengthN_path_rule_candidates(
+            n=config.body_length,
+            limit=config.candidate_limit,
+            affected_relations=config.changed_relations,
+            factual_only=config.factual_only,
+        )
+        candidates = self._dedup_by_signature(candidates)
+        candidates = self._prune_low_confidence_upper_bound(
+            candidates,
+            config.min_pca_confidence,
+            config.confidence_ub_weight,
+        )
+        candidates = self._apply_head_bucket_budget(candidates, config.head_budget_per_relation)
+        head_counts = self._repo_call(
+            "head_relation_counts",
+            factual_only=config.factual_only,
+        )
+        return self._to_rules_from_candidates(candidates, head_counts, config)
 
     def mine_length3_rules(self, config: MiningConfig) -> list[Rule]:
         self._factual_only = bool(config.factual_only)

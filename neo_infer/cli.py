@@ -205,7 +205,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_health.set_defaults(func=_cmd_health)
 
     p_mine = sub.add_parser("mine", help="mine rules")
-    p_mine.add_argument("--body-length", type=int, choices=[2, 3], default=2)
+    p_mine.add_argument("--body-length", type=int, choices=[2, 3, 4, 5], default=2)
     p_mine.add_argument("--limit", type=int, default=200)
     p_mine.add_argument("--min-support", type=int)
     p_mine.add_argument("--min-pca-confidence", type=float)
@@ -275,7 +275,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_inc = sub.add_parser("incremental", help="incremental mining operations")
     inc_sub = p_inc.add_subparsers(dest="incremental_command")
     p_consume = inc_sub.add_parser("consume", help="consume changelog and run incremental mining")
-    p_consume.add_argument("--body-length", type=int, choices=[2, 3], default=2)
+    p_consume.add_argument("--body-length", type=int, choices=[2, 3, 4, 5], default=2)
     p_consume.add_argument("--limit", type=int, default=200)
     p_consume.add_argument("--change-limit", type=int, default=1000)
     p_consume.add_argument("--min-support", type=int)

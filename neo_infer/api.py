@@ -85,7 +85,7 @@ CONSOLE_HTML = """<!doctype html>
 
   <div class="card">
     <h3>Mine Rules</h3>
-    <div class="row"><label>Body Length</label><select id="mineBodyLength"><option value="2">2</option><option value="3">3</option></select></div>
+    <div class="row"><label>Body Length</label><select id="mineBodyLength"><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option></select></div>
     <div class="row"><label>Limit</label><input id="mineLimit" type="number" value="200" /></div>
     <div class="row"><label>Min Support</label><input id="mineSupport" type="number" value="1" /></div>
     <div class="row"><label>Min PCA Confidence</label><input id="minePca" type="number" step="0.01" value="0.1" /></div>
@@ -135,7 +135,7 @@ u2,locatedIn,u3</textarea>
 
   <div class="card">
     <h3>Incremental Consume</h3>
-    <div class="row"><label>Body Length</label><select id="incBodyLength"><option value="2">2</option><option value="3">3</option></select></div>
+    <div class="row"><label>Body Length</label><select id="incBodyLength"><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option></select></div>
     <div class="row"><label>Limit</label><input id="incLimit" type="number" value="100" /></div>
     <div class="row"><label>Change Limit</label><input id="incChangeLimit" type="number" value="1000" /></div>
     <div class="row"><label>Min Support</label><input id="incSupport" type="number" value="1" /></div>
@@ -441,10 +441,7 @@ def mine_rules(
         head_budget_per_relation=payload.head_budget_per_relation,
         confidence_ub_weight=payload.confidence_ub_weight,
     )
-    if payload.body_length == 3:
-        discovered = miner.mine_length3_rules(config)
-    else:
-        discovered = miner.mine_length2_rules(config)
+    discovered = miner.mine_rules(config)
     store = RuleStore(db)
     store.upsert_rules(discovered)
     return MineRulesResponse(rules=discovered)

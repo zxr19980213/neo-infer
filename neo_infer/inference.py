@@ -38,7 +38,10 @@ class InferenceEngine:
         conflict_relations = self.conflict_rule_map.get(rule.head_relation, set())
         total = 0
         for negative_relation in conflict_relations:
-            total += self.query_repo.count_conflicts_for_rule(rule, negative_relation)
+            if hasattr(self.query_repo, "count_conflicts_generic"):
+                total += self.query_repo.count_conflicts_generic(rule, negative_relation)
+            else:
+                total += self.query_repo.count_conflicts_for_rule(rule, negative_relation)
         return total
 
     def _persist_conflicts_for_rule(self, rule: Any, iteration: int) -> int:
@@ -57,6 +60,8 @@ class InferenceEngine:
         return total
 
     def _apply_rule(self, rule) -> int:
+        if hasattr(self.query_repo, "apply_rule_generic"):
+            return self.query_repo.apply_rule_generic(rule)
         body_len = self._body_length(rule)
         if body_len == 2:
             return self.query_repo.apply_length2_rule(rule)

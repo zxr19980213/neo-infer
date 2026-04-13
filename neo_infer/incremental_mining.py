@@ -88,7 +88,12 @@ class IncrementalMiningService:
         for rule in existing_rules:
             if len(rule.body_relations) != body_length:
                 continue
-            if body_length == 2:
+            if hasattr(repo, "compute_rule_metrics"):
+                metrics = repo.compute_rule_metrics(
+                    rule.body_relations,
+                    rule.head_relation,
+                )
+            elif body_length == 2:
                 metrics = repo.compute_length2_rule_metrics(
                     rule.body_relations[0],
                     rule.body_relations[1],

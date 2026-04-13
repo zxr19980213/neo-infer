@@ -620,3 +620,246 @@ class QueryRepository:
                     )
                 )
             return result
+
+    # ─── Generic length-N helpers ───────────────────────────────────
+
+    @staticmethod
+    def _build_body_match(body_rels: tuple[str, ...] | list[str]) -> str:
+        """Build MATCH pattern: (x)-[:`r1`]->(m1)-[:`r2`]->(m2)-...->(y)."""
+        n = len(body_rels)
+        nodes = ["x"] + [f"m{i}" for i in range(1, n)] + ["y"]
+        parts = [f"({nodes[0]})"]
+        for i in range(n):
+            escaped = body_rels[i].replace("`", "")
+            parts.append(f"-[:`{escaped}`]->({nodes[i + 1]})")
+        return "".join(parts)
+
+    @staticmethod
+    def _build_body_match_vars(n: int) -> str:
+        """Build MATCH pattern with edge variables: (x)-[e0]->(m1)-[e1]->...->(y)."""
+        nodes = ["x"] + [f"m{i}" for i in range(1, n)] + ["y"]
+        parts = [f"({nodes[0]})"]
+        for i in range(n):
+            parts.append(f"-[e{i}]->({nodes[i + 1]})")
+        return "".join(parts)
+
+    @staticmethod
+    def _type_filters(n: int) -> str:
+        """Generate 'type(e0) = $r1 AND type(e1) = $r2 AND ...'."""
+        return " AND ".join(f"type(e{i}) = $r{i + 1}" for i in range(n))
+
+    @staticmethod
+    def _factual_edge_filters(n: int, factual_only: bool) -> str:
+        """Generate AND-prefixed factual_only clauses for n edge variables."""
+        if not factual_only:
+            return ""
+        clauses = " AND ".join(
+            f"coalesce(e{i}.is_inferred, false) = false" for i in range(n)
+        )
+        return f" AND {clauses}"
+
+    @staticmethod
+    def _body_rel_params(body_rels: tuple[str, ...] | list[str]) -> dict[str, str]:
+        return {f"r{i + 1}": rel for i, rel in enumerate(body_rels)}
+
+    def compute_rule_metrics(
+        self,
+        body_rels: tuple[str, ...] | list[str],
+        head_rel: str,
+        *,
+        factual_only: bool = True,
+    ) -> dict[str, int]:
+        """Compute support/pca_denominator/head_count for any body length."""
+        n = len(body_rels)
+        if n == 2:
+            return self.compute_length2_rule_metrics(
+                body_rels[0], body_rels[1], head_rel, factual_only=factual_only,
+            )
+        if n == 3:
+            return self.compute_length3_rule_metrics(
+                body_rels[0], body_rels[1], body_rels[2], head_rel,
+                factual_only=factual_only,
+            )
+        chain = self._build_body_match_vars(n)
+        tf = self._type_filters(n)
+        ff = self._factual_edge_filters(n, factual_only)
+        hf = "AND coalesce(h.is_inferred, false) = false" if factual_only else ""
+        hf2 = "AND coalesce(hh.is_inferred, false) = false" if factual_only else ""
+
+        query = f"""
+        CALL () {{
+          MATCH {chain}
+          WHERE {tf}{ff}
+          MATCH (x)-[h]->(y)
+          WHERE type(h) = $head_rel {hf}
+          RETURN count(DISTINCT [x, y]) AS support
+        }}
+        CALL () {{
+          MATCH {chain}
+          WHERE {tf}{ff}
+            AND EXISTS {{
+              MATCH (x)-[hh]->()
+              WHERE type(hh) = $head_rel {hf2}
+            }}
+          RETURN count(DISTINCT [x, y]) AS pca_denominator
+        }}
+        CALL () {{
+          MATCH ()-[h]->()
+          WHERE type(h) = $head_rel {hf}
+          RETURN count(h) AS head_count
+        }}
+        RETURN support, pca_denominator, head_count
+        """
+        params = self._body_rel_params(body_rels)
+        params["head_rel"] = head_rel
+        params["factual_only"] = factual_only
+        with self._driver.session(database=self._database) as session:
+            row = session.run(query, params).single()
+            if row is None:
+                return {"support": 0, "pca_denominator": 0, "head_count": 0}
+            return {
+                "support": int(row["support"]),
+                "pca_denominator": int(row["pca_denominator"]),
+                "head_count": int(row["head_count"]),
+            }
+
+    def apply_rule_generic(self, rule: Rule) -> int:
+        """Apply a rule of any body length."""
+        n = len(rule.body_relations)
+        if n == 2:
+            return self.apply_length2_rule(rule)
+        if n == 3:
+            return self.apply_length3_rule(rule)
+        match_pattern = self._build_body_match(rule.body_relations)
+        head_rel = rule.head_relation.replace("`", "")
+        query = f"""
+        MATCH {match_pattern}
+        WITH DISTINCT x, y
+        WHERE NOT EXISTS {{ MATCH (x)-[:`{head_rel}`]->(y) }}
+        MERGE (x)-[h:`{head_rel}`]->(y)
+        ON CREATE SET h.is_inferred = true,
+                      h.source_rule_id = $rule_id,
+                      h.rule_confidence = $confidence,
+                      h.inferred_at = datetime()
+        RETURN count(h) AS created_count
+        """
+        with self._driver.session(database=self._database) as session:
+            record = session.run(
+                query,
+                {"rule_id": rule.rule_id, "confidence": rule.pca_confidence},
+            ).single()
+            return int(record["created_count"]) if record else 0
+
+    def count_conflicts_generic(self, rule: Rule, negative_relation: str) -> int:
+        """Count conflicts for a rule of any body length."""
+        n = len(rule.body_relations)
+        if n in (2, 3):
+            return self.count_conflicts_for_rule(rule, negative_relation)
+        match_pattern = self._build_body_match(rule.body_relations)
+        head_rel = rule.head_relation.replace("`", "")
+        neg_rel = negative_relation.replace("`", "")
+        query = f"""
+        MATCH {match_pattern}
+        WITH DISTINCT x, y
+        WHERE NOT EXISTS {{ MATCH (x)-[:`{head_rel}`]->(y) }}
+          AND EXISTS {{ MATCH (x)-[:`{neg_rel}`]->(y) }}
+        RETURN count(*) AS conflict_count
+        """
+        with self._driver.session(database=self._database) as session:
+            record = session.run(query).single()
+            return int(record["conflict_count"]) if record else 0
+
+    def lengthN_body_candidates(
+        self,
+        n: int,
+        limit: int = 5000,
+        affected_relations: list[str] | None = None,
+        factual_only: bool = True,
+    ) -> list[tuple[tuple[str, ...], int]]:
+        """Enumerate body candidates of length n. Returns [(body_rels, support)]."""
+        if n == 2:
+            raw = self.length2_body_candidates(limit=limit, affected_relations=affected_relations, factual_only=factual_only)
+            return [((r1, r2), sup) for r1, r2, sup in raw]
+        if n == 3:
+            raw = self.length3_body_candidates(limit=limit, affected_relations=affected_relations, factual_only=factual_only)
+            return [((r1, r2, r3), sup) for r1, r2, r3, sup in raw]
+
+        rels = [item.strip().replace("`", "") for item in (affected_relations or []) if item.strip()]
+        chain = self._build_body_match_vars(n)
+        type_vars = ", ".join(f"type(e{i}) AS r{i + 1}" for i in range(n))
+        ff = self._factual_edge_filters(n, factual_only)
+        ff_standalone = ff.lstrip(" AND ") if ff else "true"
+        rels_check = " OR ".join(f"r{i + 1} IN $rels" for i in range(n))
+
+        query = f"""
+        MATCH {chain}
+        WHERE (NOT $factual_only) OR ({ff_standalone})
+        WITH {type_vars}, collect(DISTINCT [x, y]) AS pairs
+        WHERE size($rels) = 0 OR {rels_check}
+        RETURN {", ".join(f"r{i + 1}" for i in range(n))}, size(pairs) AS body_support
+        ORDER BY body_support DESC
+        LIMIT $limit
+        """
+        with self._driver.session(database=self._database) as session:
+            rows = list(session.run(query, {"rels": rels, "limit": int(limit), "factual_only": factual_only}))
+            return [
+                (tuple(str(row[f"r{i + 1}"]) for i in range(n)), int(row["body_support"]))
+                for row in rows
+            ]
+
+    def lengthN_path_rule_candidates(
+        self,
+        n: int,
+        limit: int = 5000,
+        affected_relations: list[str] | None = None,
+        factual_only: bool = True,
+    ) -> list[PathRuleCandidate]:
+        """Discover path rule candidates for body length n (generic)."""
+        if n == 2:
+            if affected_relations:
+                return self.length2_path_rule_candidates_incremental(limit, affected_relations, factual_only=factual_only)
+            return self.length2_path_rule_candidates(limit=limit, factual_only=factual_only)
+        if n == 3:
+            if affected_relations:
+                return self.length3_path_rule_candidates_incremental(limit, affected_relations, factual_only=factual_only)
+            return self.length3_path_rule_candidates(limit=limit, factual_only=factual_only)
+
+        bodies = self.lengthN_body_candidates(n, limit=limit, affected_relations=affected_relations, factual_only=factual_only)
+        if not bodies:
+            return []
+
+        chain = self._build_body_match_vars(n)
+        tf = self._type_filters(n)
+        ff = self._factual_edge_filters(n, factual_only)
+        head_ff = "AND coalesce(h.is_inferred, false) = false" if factual_only else ""
+
+        candidates: list[PathRuleCandidate] = []
+        with self._driver.session(database=self._database) as session:
+            for body_rels, _ in bodies:
+                query = f"""
+                MATCH {chain}
+                WHERE {tf}{ff}
+                WITH x, y
+                MATCH (x)-[h]->(y)
+                WHERE true {head_ff}
+                WITH type(h) AS head_rel, count(DISTINCT [x, y]) AS support
+                RETURN head_rel, support
+                ORDER BY support DESC
+                LIMIT 50
+                """
+                params = self._body_rel_params(body_rels)
+                params["factual_only"] = factual_only
+                rows = list(session.run(query, params))
+                for row in rows:
+                    head = str(row["head_rel"])
+                    sup = int(row["support"])
+                    metrics = self.compute_rule_metrics(body_rels, head, factual_only=factual_only)
+                    candidates.append(PathRuleCandidate(
+                        body_relations=body_rels,
+                        head_relation=head,
+                        support=sup,
+                        pca_denominator=metrics.get("pca_denominator", 0),
+                    ))
+
+        candidates.sort(key=lambda c: c.support, reverse=True)
+        return candidates[:limit]
