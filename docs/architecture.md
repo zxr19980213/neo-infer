@@ -1,0 +1,262 @@
+# 知识图谱归纳逻辑编程（ILP）实施计划
+
+## 1. 核心目标
+围绕知识图谱执行两阶段闭环：
+1) **规则挖掘**：从图中学习 Horn 规则，并计算可解释性指标（support、PCA confidence、head coverage）。
+2) **规则应用**：对已采纳规则进行前向链推理，生成新三元组并可追溯来源。
+
+目标规则示例：
+- `bornIn(X,Y) ∧ locatedIn(Y,Z) → nationality(X,Z)`
+- 典型场景映射：`a→b→c` 与 `a→c` 的共现，即长度为 2 的路径规则。
+
+---
+
+## 2. 算法选型
+### 2.1 主方案：AMIE / AMIE+
+选择理由（相对传统 ILP 如 WARMR、ALEPH）：
+- 面向大规模知识图谱，工程成熟度高。
+- 自底向上枚举闭合路径 Horn 规则，适配关系型图模式。
+- 使用 **PCA Confidence** 代替 CWA，更适合不完备图数据。
+- 具备强剪枝能力，支持在可控规则空间内高效搜索。
+
+### 2.2 关键指标
+- **Support**：规则解释的 head 三元组数量。
+- **PCA Confidence**：
+  `support / #(x,y): head(x,y) ∧ ∃y': body(x,y')`
+- **Head Coverage**：规则对 head 关系覆盖程度，用于补充质量判断。
+
+### 2.3 可选增强
+若后续需支持更灵活规则形式（否定、数值约束、更大规模）：
+- 引入 **AnyBURL**（随机游走采样，速度快，工业场景友好）。
+
+---
+
+## 3. 系统架构
+```
+用户交互层
+  └─ 规则浏览 / 采纳 / 拒绝 / 推理结果审核
+       │
+推理引擎服务（Python/Java）
+  ├─ 规则挖掘模块（AMIE+ / AnyBURL）
+  ├─ 规则应用模块（前向链推理）
+  └─ 规则存储与管理（规则库 + 状态 + 版本）
+       │
+Neo4j 图数据库
+  ├─ 原始知识图谱
+  └─ 推理新增边（带来源规则与置信度标记）
+```
+
+---
+
+## 4. 模块拆解与实现路径
+## 模块 1：高效图查询层（Neo4j/Cypher）
+目标：将 AMIE+ 所需统计尽量下推到 Neo4j，避免全图载入内存。
+
+关键查询模板：
+- support 统计
+- PCA 分母统计
+- 候选规则枚举（长度 2~3 的闭合路径）
+
+设计要点：
+- 按关系类型建索引
+- 高频查询结果缓存
+- 使用 APOC 做路径聚合（如可用）
+
+## 模块 2：规则挖掘引擎（Python）
+核心流程：
+1) 初始化：关系频次统计、关系→实体倒排索引。
+2) 候选生成：从长度 1 起，逐步扩展 body atom（dangling/closing）。
+3) 剪枝：
+   - `support < min_support` 丢弃
+   - `PCA confidence < min_confidence` 丢弃
+   - `head coverage < threshold` 丢弃
+   - `rule_length > max_length`（默认 3）停止扩展
+4) 输出：规则集合及指标（support/confidence/head_coverage）。
+
+性能优化：
+- batch Cypher（减少网络往返）
+- Bloom filter 快速 membership 检测
+- 按 head relation 并行挖掘
+- 图更新后的增量重算
+
+## 模块 3：规则管理
+规则元数据字段：
+- `rule_id`
+- 规则体文本表示
+- `support / confidence / head_coverage`
+- `status`: discovered → adopted → applied / rejected（带状态机校验）
+- `version`（图更新后重算管理）
+
+状态转换规则（已实现服务端强制校验）：
+- `discovered` → `adopted` | `rejected`
+- `adopted` → `rejected` | `applied`（`applied` 仅由推理引擎设置）
+- `applied` / `rejected` 为终态
+
+存储位置：
+- Neo4j 专用 `Rule` 节点。
+
+## 模块 4：前向链推理（规则应用）
+对已采纳规则 `body1 ∧ body2 → head`：
+1) 匹配满足 body 的绑定 `(x, y)`
+2) 检查 `head(x, y)` 是否已存在
+3) 不存在则创建新边，并记录：
+   - `source_rule_id`
+   - `confidence`
+   - `inferred_at`
+   - `is_inferred = true`
+
+链式推理：
+- 新推理边可继续作为输入
+- 使用 fixpoint iteration，直到无新边
+- 设置最大迭代轮次避免死循环
+
+---
+
+## 5. 技术栈建议
+- 图数据库：Neo4j 5.x（向下兼容 4.x）
+- 挖掘引擎：Python + neo4j driver（可快速迭代）
+- 并行：multiprocessing / Ray
+- 规则存储：Neo4j 内规则节点
+- API：FastAPI（暴露挖掘/采纳/推理接口）
+- 前端：内置轻量 Web 控制台（`/console`）
+
+---
+
+## 6. 实施路线图
+### Phase 1（MVP）
+- 规则长度 `<=2`
+- 支持路径规则：`r1(X,Z) ∧ r2(Z,Y) → r3(X,Y)`
+- 用 Cypher 计算 support 与 PCA confidence
+- 输出规则排序列表
+
+### Phase 2
+- 实现前向链推理（单轮）
+- 新边写入 Neo4j，并写入来源与标记字段
+
+### Phase 3
+- 扩展到长度 3 规则
+- 引入剪枝优化
+- 支持增量更新
+
+### Phase 4
+- 实现 fixpoint 链式推理
+- 规则状态管理（采纳/拒绝/版本）
+- 冲突检测（推理新边与已有事实矛盾）
+
+### Phase 5（持续）
+- 批量查询优化
+- 引入 AnyBURL 风格随机游走采样（超大图）
+- 规则质量评估（precision/recall）
+
+---
+
+## 7. 关键架构决策：引擎内置 vs 外置
+### 方案 A：Neo4j 内部（Java Procedure）
+- 优点：性能上限高、无网络 I/O。
+- 缺点：开发调试复杂、与数据库版本耦合更强。
+
+### 方案 B：外部服务（Python）
+- 优点：迭代快、实现灵活、验证成本低。
+- 缺点：大图场景受网络 I/O 影响，需要 batch 缓解。
+
+### 结论（当前建议）
+- **Phase 1~3 采用外部 Python 服务**，优先验证算法正确性与流程完整性；
+- 若性能不足，再将核心统计逻辑迁移为 Neo4j Procedure。
+
+---
+
+## 8. 验收标准（MVP 到可用）
+- 能输出可排序规则清单（含 support/PCA confidence/head coverage）
+- 能对“已采纳规则”执行推理并落库新增边
+- 新增边具备完整溯源信息（规则 ID、置信度、时间戳）
+- 支持至少一次链式迭代，且具备最大轮次保护
+- 规则状态流转可审计（discovered/adopted/applied/rejected + version）
+
+---
+
+## 9. 当前完成度快照（2026-04）
+
+### 已完成（落地并验证）
+- **规则挖掘/推理闭环**：length2/length3 挖掘、规则采纳、单轮+fixpoint 推理、规则状态与版本管理。
+- **冲突管理**：冲突规则 DB 化管理（CRUD）、冲突实例记录与查询、length3 冲突匹配一致性修复。
+- **增量链路**：
+  - `POST /changes/append` + `POST /rules/mine/incremental/from-changelog` 可用；
+  - 覆盖非空 delta、混合 add/remove、幂等重复消费；
+  - length3 增量从“全量后过滤”升级为增量候选路径。
+- **AMIE/AMIE+ 搜索框架**（P0-1 已落地）：
+  - `dangling -> closing -> 阈值剪枝` 结构化流程（length2/length3）；
+  - canonical 去重、support/no-gain 剪枝、optimistic confidence upper-bound；
+  - 第二批剪枝：`beam_width`（层级 Top-B）、`head_budget_per_relation`（head 分桶预算）、局部统计收紧 `confidence_ub_weight`。
+- **统计防污染机制**：
+  - 挖掘侧新增 `factual_only` 开关（默认开启）；
+  - body/support/PCA/head_count 与功能性统计默认排除 `is_inferred=true` 边，避免 benchmark 被历史推理边污染。
+- **ChangeLog 混合模式基础能力（已落地）**：
+  - App 通道支持 `batch_id` / `idempotency_key` / `context` 元信息；
+  - `ChangeLog.dedup_key` 唯一约束与索引落地，支持跨通道去重键策略；
+  - 增量消费窗口内对同一边事件做 add/remove 折叠，减少重复与抖动影响；
+  - 提供 trigger 管理接口：`POST /triggers/changelog/install`、`DELETE /triggers/changelog`；
+  - Trigger 默认过滤系统内部标签，避免 `ChangeLog` 与系统节点自触发循环；
+  - Trigger 安装/卸载/列表统一走 `system` 库上下文，并增加跨库可见性与延迟重试诊断；
+  - 为避免并发事务下 `change_seq` 冲突，Trigger 回调不再直接写 `change_seq`，改由消费前统一补齐。
+- **P1 工程化**：
+  - Neo4j 索引/约束脚本化 + 启动幂等 bootstrap；
+  - 查询批量化优化（按 head relation 分桶，减少 round-trip）；
+  - `id()` 游标迁移到应用层 `change_seq`。
+- **压测与索引迭代工具链**：
+  - 大数据生成脚本：`scripts/bench_seed_large.py`
+  - 端到端基准脚本：`scripts/bench_api_perf.py`
+  - 索引策略对比：`scripts/bench_index_strategies.py`
+- **规则状态机强制校验**：
+  - `adopt`/`reject` API 端点增加状态转换校验，非法转换返回 409；
+  - 规则不存在返回 404（而非之前的 200 + `not_found`）；
+  - `applied`/`rejected` 为终态，不可再转换。
+- **Trigger 管理 Neo4j 5.x 兼容**：
+  - `list_triggers()` 和 `_probe_apoc_trigger()` 优先使用 `apoc.trigger.show($database)`；
+  - 回退到 `apoc.trigger.list()` 兼容 4.x。
+- **Web 控制台增强**：
+  - 新增 Rules Management 面板：规则表格 + 状态筛选 + Adopt/Reject 按钮 + Adopt All；
+  - 状态徽章颜色编码，按钮按状态机规则自动禁用。
+- **自动化测试**：
+  - 35 个 pytest smoke tests（含 10 个状态转换覆盖用例）。
+
+### 部分完成（可用但仍可深化）
+- **真增量计数**：已实现受影响规则增量更新闭环；事件级 +1/-1 原子计数（尽量免重算）仍可继续深化。
+- **AMIE+ 深层剪枝**：现有高收益剪枝已齐备，仍可继续补更强上界估计与跨层冗余证明型剪枝。
+- **DB Trigger 全量捕获**：主链路已可用；仍需补充高并发写入下的稳定性压测、删除关系事件覆盖验证与生产级监控告警。
+
+### 未完成（后续目标）
+- 规则质量评估闭环（precision/recall）与标准评测集。
+- 超大图并行挖掘（Ray/multiprocessing）与资源调度策略。
+- AnyBURL 风格随机游走采样增强。
+
+---
+
+## 10. 下一阶段优先级（重排）
+
+### P0（当前最优先）
+1) **事件级增量计数（support/pca_denom/head_count）**
+   - 从“受影响规则重算”继续收敛到“事件驱动原子更新”；
+   - length2 先稳定，再扩展到 length3。
+2) **真实大图集成压测闭环**
+   - 固定数据规模与负载模板，输出 mean/p95/max、失败率、资源利用；
+   - 索引策略迭代形成可复现基线报告。
+3) **规则质量评估基线**
+   - 增加 precision/recall 或 holdout 评估，避免仅靠 support/confidence 排序。
+
+### P1（工程增强）
+1) 生命周期与运行稳定性：
+   - FastAPI `on_event` 迁移到 lifespan，清理弃用告警。
+2) 性能可观测性：
+   - 慢查询采样、关键路径埋点（挖掘/推理/增量）。
+3) 压测报告自动聚合：
+   - 统一生成策略对比与回归阈值告警。
+4) 增量挖掘 `factual_only` 一致性：
+   - `_update_existing_rules_by_delta` 需透传 `factual_only` 参数。
+5) 并发安全加固：
+   - `IdSequence` / `ChangeLog.change_seq` 并发写入竞争。
+   - 推理 `NOT EXISTS` + `MERGE` 并发重复边。
+
+### P2（能力扩展）
+1) AnyBURL 路径试验与效果评估。
+2) 规则质量评估体系（precision/recall）产品化。
+3) Web 控制台进一步增强（可选）。
