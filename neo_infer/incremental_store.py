@@ -66,6 +66,7 @@ class IncrementalStore:
                     "idempotency_key": idem_norm,
                     "metadata": context_json,
                     "dedup_key": dedup_key,
+                    "is_inferred": bool(edge.is_inferred),
                 }
             )
             seq += 1
@@ -83,6 +84,7 @@ class IncrementalStore:
                     "idempotency_key": idem_norm,
                     "metadata": context_json,
                     "dedup_key": dedup_key,
+                    "is_inferred": bool(edge.is_inferred),
                 }
             )
             seq += 1
@@ -108,6 +110,7 @@ class IncrementalStore:
                           c.batch_id = event.batch_id,
                           c.idempotency_key = event.idempotency_key,
                           c.metadata = event.metadata,
+                          c.is_inferred = coalesce(event.is_inferred, false),
                           c.created_at = coalesce(event.created_at, datetime())
             """,
             {"events": payload},
@@ -120,10 +123,11 @@ class IncrementalStore:
             MERGE (counter:IdSequence {name: 'ChangeLog'})
             ON CREATE SET counter.next_seq = 1
             WITH counter, collect(c) AS rows
-            UNWIND range(0, size(rows) - 1) AS idx
-            WITH counter, rows[idx] AS row, idx
+            WITH counter, rows, size(rows) AS assigned
+            UNWIND range(0, assigned - 1) AS idx
+            WITH counter, rows[idx] AS row, idx, assigned
             SET row.change_seq = toInteger(counter.next_seq) + idx
-            WITH counter, size(rows) AS assigned
+            WITH DISTINCT counter, assigned
             SET counter.next_seq = toInteger(counter.next_seq) + assigned
             """,
         )
@@ -168,6 +172,7 @@ class IncrementalStore:
                    c.src AS src,
                    c.rel AS rel,
                    c.dst AS dst,
+                   coalesce(c.is_inferred, false) AS is_inferred,
                    toString(c.created_at) AS created_at
             ORDER BY change_id ASC
             LIMIT $limit
@@ -183,31 +188,48 @@ class IncrementalStore:
         """Merge duplicate/cancelling events within one consumed window."""
         state_map: dict[tuple[str, str, str], str] = {}
         ts_map: dict[tuple[str, str, str], str | None] = {}
+        inferred_map: dict[tuple[str, str, str], bool] = {}
         max_id = cursor
         for row in rows:
             key = (str(row["src"]), str(row["rel"]), str(row["dst"]))
             op = "removed" if str(row["event_type"]) == "removed" else "added"
+            inferred = bool(row.get("is_inferred"))
             prev = state_map.get(key)
             if prev == "added" and op == "removed":
                 # add then remove in same window -> net zero
                 state_map.pop(key, None)
                 ts_map.pop(key, None)
+                inferred_map.pop(key, None)
             elif prev == "removed" and op == "added":
                 # remove then add -> net add
                 state_map[key] = "added"
                 ts_map[key] = row.get("created_at")
+                inferred_map[key] = inferred
             else:
                 state_map[key] = op
                 ts_map[key] = row.get("created_at")
+                inferred_map[key] = inferred
             max_id = max(max_id, int(row["change_id"]))
 
         added = [
-            ChangeEdge(src=s, rel=r, dst=d, created_at=ts_map.get((s, r, d)))
+            ChangeEdge(
+                src=s,
+                rel=r,
+                dst=d,
+                created_at=ts_map.get((s, r, d)),
+                is_inferred=inferred_map.get((s, r, d), False),
+            )
             for (s, r, d), op in state_map.items()
             if op == "added"
         ]
         removed = [
-            ChangeEdge(src=s, rel=r, dst=d, created_at=ts_map.get((s, r, d)))
+            ChangeEdge(
+                src=s,
+                rel=r,
+                dst=d,
+                created_at=ts_map.get((s, r, d)),
+                is_inferred=inferred_map.get((s, r, d), False),
+            )
             for (s, r, d), op in state_map.items()
             if op == "removed"
         ]

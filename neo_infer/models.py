@@ -138,6 +138,7 @@ class ChangeEdge(BaseModel):
     rel: str
     dst: str
     created_at: str | None = None
+    is_inferred: bool = False
 
 
 class DeltaBatch(BaseModel):

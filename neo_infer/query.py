@@ -863,3 +863,116 @@ class QueryRepository:
 
         candidates.sort(key=lambda c: c.support, reverse=True)
         return candidates[:limit]
+
+    def length2_neighborhood_edges(
+        self,
+        *,
+        r1: str,
+        r2: str,
+        head_rel: str,
+        node_keys: list[str],
+        factual_only: bool = True,
+    ) -> list[tuple[str, str, str]]:
+        """Load the current length-2 counter neighborhood around changed endpoints.
+
+        Returned edges use ``coalesce(node.id, elementId(node))`` as endpoints.
+        The closure is the edges required to decide whether a length-2 body
+        pair or head fact changed: r1/r2/head edges incident to the seeds, then
+        every r1 and head edge out of the body sources, then every r2 edge out
+        of the body mids.
+        """
+        keys = list(dict.fromkeys(key for key in node_keys if key))
+        if not keys:
+            return []
+        rel_types = list(dict.fromkeys((r1, r2, head_rel)))
+        with self._driver.session(database=self._database) as session:
+            edges, extra_sources, extra_mids = self._length2_edges_touching(
+                session,
+                keys=keys,
+                rel_types=rel_types,
+                r1=r1,
+                factual_only=factual_only,
+                include_incoming_r1=True,
+            )
+            expand_keys = list(dict.fromkeys([*keys, *extra_sources, *extra_mids]))
+            more, _sources, more_mids = self._length2_edges_touching(
+                session,
+                keys=expand_keys,
+                rel_types=rel_types,
+                r1=r1,
+                factual_only=factual_only,
+                include_incoming_r1=False,
+            )
+            edges.update(more)
+            new_mids = [mid for mid in more_mids if mid not in expand_keys]
+            if new_mids:
+                r2_only, _, _ = self._length2_edges_touching(
+                    session,
+                    keys=list(dict.fromkeys(new_mids)),
+                    rel_types=[r2],
+                    r1=r1,
+                    factual_only=factual_only,
+                    include_incoming_r1=False,
+                )
+                edges.update(r2_only)
+        return sorted(edges)
+
+    def _length2_edges_touching(
+        self,
+        session,
+        *,
+        keys: list[str],
+        rel_types: list[str],
+        r1: str,
+        factual_only: bool,
+        include_incoming_r1: bool,
+    ) -> tuple[set[tuple[str, str, str]], list[str], list[str]]:
+        if not keys:
+            return set(), [], []
+        incoming = ""
+        if include_incoming_r1:
+            incoming = """
+            UNION
+            UNWIND $node_keys AS key
+            MATCH (n)
+            WHERE n.id = key OR elementId(n) = key
+            MATCH (m)-[e]->(n)
+            WHERE type(e) = $r1
+              AND ($factual_only = false OR coalesce(e.is_inferred, false) = false)
+            RETURN coalesce(m.id, elementId(m)) AS src,
+                   type(e) AS rel,
+                   coalesce(n.id, elementId(n)) AS dst
+            """
+        query = f"""
+        UNWIND $node_keys AS key
+        MATCH (n)
+        WHERE n.id = key OR elementId(n) = key
+        MATCH (n)-[e]->(m)
+        WHERE type(e) IN $rel_types
+          AND ($factual_only = false OR coalesce(e.is_inferred, false) = false)
+        RETURN coalesce(n.id, elementId(n)) AS src,
+               type(e) AS rel,
+               coalesce(m.id, elementId(m)) AS dst
+        {incoming}
+        """
+        rows = session.run(
+            query,
+            {
+                "node_keys": keys,
+                "rel_types": rel_types,
+                "r1": r1,
+                "factual_only": bool(factual_only),
+            },
+        )
+        edges: set[tuple[str, str, str]] = set()
+        sources: list[str] = []
+        mids: list[str] = []
+        for row in rows:
+            src = str(row["src"])
+            rel = str(row["rel"])
+            dst = str(row["dst"])
+            edges.add((src, rel, dst))
+            if rel == r1:
+                sources.append(src)
+                mids.append(dst)
+        return edges, sources, mids
