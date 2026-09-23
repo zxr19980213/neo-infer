@@ -976,3 +976,130 @@ class QueryRepository:
                 sources.append(src)
                 mids.append(dst)
         return edges, sources, mids
+
+    def length3_neighborhood_edges(
+        self,
+        *,
+        r1: str,
+        r2: str,
+        r3: str,
+        head_rel: str,
+        node_keys: list[str],
+        factual_only: bool = True,
+    ) -> list[tuple[str, str, str]]:
+        """Load the current length-3 counter neighborhood around changed endpoints.
+
+        Returned edges use ``coalesce(node.id, elementId(node))``. Sources are
+        the seeds plus every node that reaches a seed by one ``r1`` hop or by
+        an ``r1`` then ``r2`` hop. From those sources the query loads ``r1``,
+        the following ``r2`` and ``r3``, and outgoing head edges. Seeds stay
+        in the later hops so a removed edge, absent from the current graph,
+        can be put back beside the hops that are still stored.
+        """
+        keys = list(dict.fromkeys(key for key in node_keys if key))
+        if not keys:
+            return []
+        with self._driver.session(database=self._database) as session:
+            sources = list(
+                dict.fromkeys(
+                    [
+                        *keys,
+                        *self._length3_upstream_sources(
+                            session,
+                            keys=keys,
+                            r1=r1,
+                            r2=r2,
+                            factual_only=factual_only,
+                        ),
+                    ]
+                )
+            )
+            edges = self._length3_edges_leaving(
+                session,
+                keys=sources,
+                rel_types=[r1, head_rel],
+                factual_only=factual_only,
+            )
+            mids = [dst for _src, rel, dst in edges if rel == r1]
+            second = self._length3_edges_leaving(
+                session,
+                keys=list(dict.fromkeys([*mids, *keys])),
+                rel_types=[r2],
+                factual_only=factual_only,
+            )
+            edges.update(second)
+            tails = [dst for _src, rel, dst in second if rel == r2]
+            edges.update(
+                self._length3_edges_leaving(
+                    session,
+                    keys=list(dict.fromkeys([*tails, *keys])),
+                    rel_types=[r3],
+                    factual_only=factual_only,
+                )
+            )
+        return sorted(edges)
+
+    def _length3_upstream_sources(
+        self,
+        session,
+        *,
+        keys: list[str],
+        r1: str,
+        r2: str,
+        factual_only: bool,
+    ) -> list[str]:
+        if not keys:
+            return []
+        query = """
+        UNWIND $node_keys AS key
+        MATCH (n)
+        WHERE n.id = key OR elementId(n) = key
+        MATCH (x)-[e1]->(n)
+        WHERE type(e1) = $r1
+          AND ($factual_only = false OR coalesce(e1.is_inferred, false) = false)
+        RETURN DISTINCT coalesce(x.id, elementId(x)) AS source
+        UNION
+        UNWIND $node_keys AS key
+        MATCH (n)
+        WHERE n.id = key OR elementId(n) = key
+        MATCH (m)-[e2]->(n)
+        WHERE type(e2) = $r2
+          AND ($factual_only = false OR coalesce(e2.is_inferred, false) = false)
+        MATCH (x)-[e1]->(m)
+        WHERE type(e1) = $r1
+          AND ($factual_only = false OR coalesce(e1.is_inferred, false) = false)
+        RETURN DISTINCT coalesce(x.id, elementId(x)) AS source
+        """
+        rows = session.run(
+            query,
+            {"node_keys": keys, "r1": r1, "r2": r2, "factual_only": bool(factual_only)},
+        )
+        return [str(row["source"]) for row in rows]
+
+    def _length3_edges_leaving(
+        self,
+        session,
+        *,
+        keys: list[str],
+        rel_types: list[str],
+        factual_only: bool,
+    ) -> set[tuple[str, str, str]]:
+        rels = list(dict.fromkeys(rel for rel in rel_types if rel))
+        if not keys or not rels:
+            return set()
+        query = """
+        UNWIND $node_keys AS key
+        MATCH (n)
+        WHERE n.id = key OR elementId(n) = key
+        MATCH (n)-[e]->(m)
+        WHERE type(e) IN $rel_types
+          AND ($factual_only = false OR coalesce(e.is_inferred, false) = false)
+        RETURN DISTINCT coalesce(n.id, elementId(n)) AS src,
+               type(e) AS rel,
+               coalesce(m.id, elementId(m)) AS dst
+        """
+        rows = session.run(
+            query,
+            {"node_keys": keys, "rel_types": rels, "factual_only": bool(factual_only)},
+        )
+        return {(str(row["src"]), str(row["rel"]), str(row["dst"])) for row in rows}

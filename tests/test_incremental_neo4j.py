@@ -1,4 +1,4 @@
-"""Live Neo4j checks for length-2 event counters.
+"""Live Neo4j checks for length-2 and length-3 event counters.
 
 The neighborhood Cypher and the stored changelog are compared with a full
 recount on the same graph. The module skips when bolt is closed so the
@@ -18,7 +18,7 @@ from neo4j.exceptions import ServiceUnavailable
 from neo_infer.api import ensure_neo4j_schema
 from neo_infer.config import Settings
 from neo_infer.db import Neo4jClient
-from neo_infer.incremental_counters import length2_stat_delta
+from neo_infer.incremental_counters import length2_stat_delta, length3_stat_delta
 from neo_infer.incremental_mining import IncrementalMiningService
 from neo_infer.incremental_store import IncrementalStore
 from neo_infer.models import ChangeEdge, MineRulesRequest, Rule, build_rule_id
@@ -130,6 +130,8 @@ class LiveGraph:
         counted_added = [edge for edge in added if not (factual_only and edge.is_inferred)]
         counted_removed = [edge for edge in removed if not (factual_only and edge.is_inferred)]
         keys = [item for edge in (*counted_added, *counted_removed) for item in (edge.src, edge.dst)]
+        added_tuples = [(edge.src, edge.rel, edge.dst) for edge in counted_added]
+        removed_tuples = [(edge.src, edge.rel, edge.dst) for edge in counted_removed]
         if len(body) == 2 and keys:
             present = {
                 (src, rel, dst)
@@ -146,8 +148,29 @@ class LiveGraph:
                 r2=body[1],
                 head=head,
                 present=present,
-                added=[(edge.src, edge.rel, edge.dst) for edge in counted_added],
-                removed=[(edge.src, edge.rel, edge.dst) for edge in counted_removed],
+                added=added_tuples,
+                removed=removed_tuples,
+            )
+        elif len(body) == 3 and keys:
+            present = {
+                (src, rel, dst)
+                for src, rel, dst in self.repo.length3_neighborhood_edges(
+                    r1=body[0],
+                    r2=body[1],
+                    r3=body[2],
+                    head_rel=head,
+                    node_keys=keys,
+                    factual_only=factual_only,
+                )
+            }
+            delta = length3_stat_delta(
+                r1=body[0],
+                r2=body[1],
+                r3=body[2],
+                head=head,
+                present=present,
+                added=added_tuples,
+                removed=removed_tuples,
             )
         else:
             delta = (0, 0, 0)
@@ -498,6 +521,218 @@ def test_changelog_roundtrip_folds_and_keeps_inferred_flag(graph: LiveGraph):
     assert len(delta.removed_edges) == 1
     assert delta.removed_edges[0].is_inferred is True
     graph.store.mark_consumed(delta.cursor)
+
+
+def test_length3_event_deltas_match_full_recount(graph: LiveGraph):
+    body = (BORN, LOC, PART)
+    head = REGION
+    graph.add("it-alice", BORN, "it-beijing")
+    graph.add("it-beijing", LOC, "it-hebei")
+    graph.add("it-hebei", PART, "it-china")
+    graph.add("it-alice", REGION, "it-china")
+    current = graph.metrics(body, head, factual_only=True)
+    assert current == {"support": 1, "pca_denominator": 1, "head_count": 1}
+
+    current = graph.assert_delta(
+        body, head, current,
+        added=[graph.add("it-shanghai", LOC, "it-zhejiang")],
+        removed=[],
+        factual_only=True,
+    )
+    assert current["support"] == 1
+
+    current = graph.assert_delta(
+        body, head, current,
+        added=[
+            graph.add("it-bob", BORN, "it-shanghai"),
+            graph.add("it-zhejiang", PART, "it-china"),
+        ],
+        removed=[],
+        factual_only=True,
+    )
+    assert current["support"] == 1
+    current = graph.assert_delta(
+        body, head, current,
+        added=[graph.add("it-bob", REGION, "it-china")],
+        removed=[],
+        factual_only=True,
+    )
+    assert current == {"support": 2, "pca_denominator": 2, "head_count": 2}
+
+    # A second body path to the same head pair must not increase support.
+    current = graph.assert_delta(
+        body, head, current,
+        added=[
+            graph.add("it-bob", BORN, "it-hangzhou"),
+            graph.add("it-hangzhou", LOC, "it-zhejiang"),
+        ],
+        removed=[],
+        factual_only=True,
+    )
+    assert current["support"] == 2
+    current = graph.assert_delta(
+        body, head, current,
+        added=[],
+        removed=[graph.remove("it-shanghai", LOC, "it-zhejiang")],
+        factual_only=True,
+    )
+    assert current["support"] == 2
+    current = graph.assert_delta(
+        body, head, current,
+        added=[],
+        removed=[graph.remove("it-bob", BORN, "it-hangzhou")],
+        factual_only=True,
+    )
+    assert current["support"] == 1
+
+    # Dropping the last middle edge removes alice's only path.
+    current = graph.assert_delta(
+        body, head, current,
+        added=[],
+        removed=[graph.remove("it-beijing", LOC, "it-hebei")],
+        factual_only=True,
+    )
+    assert current["support"] == 0
+    current = graph.assert_delta(
+        body, head, current,
+        added=[graph.add("it-beijing", LOC, "it-hebei")],
+        removed=[],
+        factual_only=True,
+    )
+    assert current["support"] == 1
+
+    # First head edge from a node pulls every body pair into the PCA denominator.
+    current = graph.assert_delta(
+        body, head, current,
+        added=[
+            graph.add("it-carol", BORN, "it-osaka"),
+            graph.add("it-osaka", LOC, "it-kansai"),
+            graph.add("it-kansai", PART, "it-japan"),
+            graph.add("it-carol", BORN, "it-seoul"),
+            graph.add("it-seoul", LOC, "it-gyeonggi"),
+            graph.add("it-gyeonggi", PART, "it-korea"),
+        ],
+        removed=[],
+        factual_only=True,
+    )
+    assert current["support"] == 1
+    pca_before_head = current["pca_denominator"]
+    support_before_head = current["support"]
+    current = graph.assert_delta(
+        body, head, current,
+        added=[graph.add("it-carol", REGION, "it-japan")],
+        removed=[],
+        factual_only=True,
+    )
+    assert current["support"] == support_before_head + 1
+    assert current["pca_denominator"] == pca_before_head + 2
+    current = graph.assert_delta(
+        body, head, current,
+        added=[graph.add("it-carol", REGION, "it-korea")],
+        removed=[],
+        factual_only=True,
+    )
+    assert current["pca_denominator"] == pca_before_head + 2
+    assert current["support"] == support_before_head + 2
+
+
+def test_length3_same_relation_on_body_atoms(graph: LiveGraph):
+    body = (LOC, LOC, LOC)
+    head = NAT
+    before = graph.metrics(body, head, factual_only=True)
+    after = graph.assert_delta(
+        body, head, before,
+        added=[
+            graph.add("it-beijing", LOC, "it-hebei"),
+            graph.add("it-hebei", LOC, "it-china"),
+            graph.add("it-china", LOC, "it-asia"),
+            graph.add("it-beijing", NAT, "it-asia"),
+        ],
+        removed=[],
+        factual_only=True,
+    )
+    assert after["support"] == before["support"] + 1
+    after = graph.assert_delta(
+        body, head, after,
+        added=[
+            graph.add("it-beijing", LOC, "it-tianjin"),
+            graph.add("it-tianjin", LOC, "it-china"),
+        ],
+        removed=[],
+        factual_only=True,
+    )
+    assert after["support"] == before["support"] + 1
+
+
+def test_length3_element_id_endpoints_match_full_recount(graph: LiveGraph):
+    body = (BORN, LOC, PART)
+    head = REGION
+    before = graph.metrics(body, head, factual_only=True)
+    with graph.client.driver.session(database=graph.client.settings.neo4j_database) as session:
+        created = session.run(
+            f"""
+            CREATE (a:ItEntity {{token: 'src'}})
+            CREATE (b:ItEntity {{token: 'm1'}})
+            CREATE (c:ItEntity {{token: 'm2'}})
+            CREATE (d:ItEntity {{token: 'dst'}})
+            CREATE (a)-[:`{BORN}`]->(b)
+            CREATE (b)-[:`{LOC}`]->(c)
+            CREATE (c)-[:`{PART}`]->(d)
+            CREATE (a)-[:`{REGION}`]->(d)
+            RETURN elementId(a) AS a, elementId(b) AS b, elementId(c) AS c, elementId(d) AS d
+            """
+        ).single()
+    assert created is not None
+    after = graph.assert_delta(
+        body, head, before,
+        added=[
+            ChangeEdge(src=str(created["a"]), rel=BORN, dst=str(created["b"])),
+            ChangeEdge(src=str(created["b"]), rel=LOC, dst=str(created["c"])),
+            ChangeEdge(src=str(created["c"]), rel=PART, dst=str(created["d"])),
+            ChangeEdge(src=str(created["a"]), rel=REGION, dst=str(created["d"])),
+        ],
+        removed=[],
+        factual_only=True,
+    )
+    assert after["support"] == before["support"] + 1
+    assert after["pca_denominator"] == before["pca_denominator"] + 1
+    assert after["head_count"] == before["head_count"] + 1
+
+
+def test_service_persists_length3_delta_on_neo4j(graph: LiveGraph):
+    body = (BORN, LOC, PART)
+    head = REGION
+    graph.add("it-alice", BORN, "it-beijing")
+    graph.add("it-beijing", LOC, "it-hebei")
+    graph.add("it-hebei", PART, "it-china")
+    graph.add("it-alice", REGION, "it-china")
+    rule = _seed(graph, body, head, factual_only=True)
+
+    added = [
+        graph.add("it-bob", BORN, "it-shanghai"),
+        graph.add("it-shanghai", LOC, "it-zhejiang"),
+        graph.add("it-zhejiang", PART, "it-china"),
+        graph.add("it-bob", REGION, "it-china"),
+    ]
+    graph.append(added)
+    _run(graph, body_length=3, factual_only=True)
+    stored = graph.store.get_rule_stat(rule.rule_id)
+    full = graph.metrics(body, head, factual_only=True)
+    assert stored is not None
+    assert (stored.support, stored.pca_denominator, stored.head_count) == (
+        full["support"],
+        full["pca_denominator"],
+        full["head_count"],
+    )
+    assert full["support"] == 2
+
+    removed = [graph.remove("it-shanghai", LOC, "it-zhejiang")]
+    graph.append([], removed)
+    _run(graph, body_length=3, factual_only=True)
+    stored = graph.store.get_rule_stat(rule.rule_id)
+    full = graph.metrics(body, head, factual_only=True)
+    assert stored is not None
+    assert stored.support == full["support"] == 1
 
 
 def test_length3_recompute_respects_factual_only(graph: LiveGraph):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from neo_infer.incremental_counters import Edge, length2_stat_delta
+from neo_infer.incremental_counters import Edge, length2_stat_delta, length3_stat_delta
 from neo_infer.incremental_store import IncrementalStore
 from neo_infer.models import ChangeEdge, MineRulesRequest, Rule
 from neo_infer.rule_management import RuleStore
@@ -140,6 +140,69 @@ class IncrementalMiningService:
             "head_count": max(0, int(stat.head_count) + delta_head),
         }
 
+    def _length3_event_metrics(
+        self,
+        rule: Rule,
+        *,
+        added_edges: list[ChangeEdge],
+        removed_edges: list[ChangeEdge],
+        factual_only: bool,
+    ) -> dict[str, int] | None:
+        """Apply a neighborhood delta when a stored length-3 baseline exists."""
+        if len(rule.body_relations) != 3:
+            return None
+        repo = self.miner._repository
+        if not hasattr(repo, "length3_neighborhood_edges"):
+            return None
+        stat = self.incremental_store.get_rule_stat(rule.rule_id)
+        if stat is None:
+            return None
+
+        r1, r2, r3 = rule.body_relations
+        head = rule.head_relation
+        relevant = {r1, r2, r3, head}
+
+        def _counts(edge: ChangeEdge) -> bool:
+            if edge.rel not in relevant:
+                return False
+            if factual_only and edge.is_inferred:
+                return False
+            return True
+
+        added = [edge for edge in added_edges if _counts(edge)]
+        removed = [edge for edge in removed_edges if _counts(edge)]
+        if not added and not removed:
+            return {
+                "support": int(stat.support),
+                "pca_denominator": int(stat.pca_denominator),
+                "head_count": int(stat.head_count),
+            }
+
+        node_keys = [item for edge in (*added, *removed) for item in (edge.src, edge.dst)]
+        present_rows = repo.length3_neighborhood_edges(
+            r1=r1,
+            r2=r2,
+            r3=r3,
+            head_rel=head,
+            node_keys=node_keys,
+            factual_only=factual_only,
+        )
+        present: set[Edge] = {(str(src), str(rel), str(dst)) for src, rel, dst in present_rows}
+        delta_support, delta_pca, delta_head = length3_stat_delta(
+            r1=r1,
+            r2=r2,
+            r3=r3,
+            head=head,
+            present=present,
+            added=[(edge.src, edge.rel, edge.dst) for edge in added],
+            removed=[(edge.src, edge.rel, edge.dst) for edge in removed],
+        )
+        return {
+            "support": max(0, int(stat.support) + delta_support),
+            "pca_denominator": max(0, int(stat.pca_denominator) + delta_pca),
+            "head_count": max(0, int(stat.head_count) + delta_head),
+        }
+
     def _update_existing_rules_by_delta(
         self,
         *,
@@ -163,13 +226,21 @@ class IncrementalMiningService:
             if len(rule.body_relations) != body_length:
                 continue
             metrics = None
-            if body_length == 2 and (added_edges or removed_edges):
-                metrics = self._length2_event_metrics(
-                    rule,
-                    added_edges=added_edges,
-                    removed_edges=removed_edges,
-                    factual_only=factual_only,
-                )
+            if added_edges or removed_edges:
+                if body_length == 2:
+                    metrics = self._length2_event_metrics(
+                        rule,
+                        added_edges=added_edges,
+                        removed_edges=removed_edges,
+                        factual_only=factual_only,
+                    )
+                elif body_length == 3:
+                    metrics = self._length3_event_metrics(
+                        rule,
+                        added_edges=added_edges,
+                        removed_edges=removed_edges,
+                        factual_only=factual_only,
+                    )
             if metrics is None:
                 metrics = self._full_metrics(rule, factual_only=factual_only)
             updated = self._rebuild_rule_with_metrics(rule, metrics)

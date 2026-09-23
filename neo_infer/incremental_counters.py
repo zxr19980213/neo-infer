@@ -27,24 +27,79 @@ def length2_stat_delta(
     therefore moves by one per distinct head edge in the batch, matching that
     identity rather than parallel-relationship multiplicity.
     """
-    relevant = {r1, r2, head}
+    present_rel, previous, added_in_graph, removed_set = _batch_states(
+        relevant={r1, r2, head},
+        present=present,
+        added=added,
+        removed=removed,
+    )
+    support_now, pca_now = _pair_counts(present_rel, r1, r2, head)
+    support_prev, pca_prev = _pair_counts(previous, r1, r2, head)
+    return (
+        support_now - support_prev,
+        pca_now - pca_prev,
+        _head_delta(added_in_graph, removed_set, head),
+    )
+
+
+def length3_stat_delta(
+    *,
+    r1: str,
+    r2: str,
+    r3: str,
+    head: str,
+    present: set[Edge],
+    added: list[Edge],
+    removed: list[Edge],
+) -> tuple[int, int, int]:
+    """Return (support, pca_denominator, head_count) deltas for one length-3 rule.
+
+    Body bindings are ``r1(X,A) ∧ r2(A,B) ∧ r3(B,Y)``. Support counts distinct
+    ``(X,Y)`` that also have a head edge. PCA counts distinct ``(X,Y)`` whose
+    ``X`` has any head edge. The batch arithmetic is the same set difference
+    as length 2: the caller passes the post-batch neighborhood, and removed
+    edges are restored into the previous neighborhood.
+
+    A body path uses three distinct logical edges. ``head_count`` still moves
+    by one per distinct head edge in the batch.
+    """
+    present_rel, previous, added_in_graph, removed_set = _batch_states(
+        relevant={r1, r2, r3, head},
+        present=present,
+        added=added,
+        removed=removed,
+    )
+    support_now, pca_now = _triple_counts(present_rel, r1, r2, r3, head)
+    support_prev, pca_prev = _triple_counts(previous, r1, r2, r3, head)
+    return (
+        support_now - support_prev,
+        pca_now - pca_prev,
+        _head_delta(added_in_graph, removed_set, head),
+    )
+
+
+def _batch_states(
+    *,
+    relevant: set[str],
+    present: set[Edge],
+    added: list[Edge],
+    removed: list[Edge],
+) -> tuple[set[Edge], set[Edge], set[Edge], set[Edge]]:
     present_rel = {edge for edge in present if edge[1] in relevant}
     added_rel = [edge for edge in added if edge[1] in relevant]
-    removed_rel = [edge for edge in removed if edge[1] in relevant]
-
-    removed_set = set(removed_rel)
+    removed_set = {edge for edge in removed if edge[1] in relevant}
     # A removed edge is absent from the current graph. Drop it if a caller
     # still included it, so the previous neighborhood can reintroduce it once.
     present_rel -= removed_set
     added_in_graph = {edge for edge in added_rel if edge in present_rel}
     previous = (present_rel - added_in_graph) | removed_set
+    return present_rel, previous, added_in_graph, removed_set
 
-    support_now, pca_now = _pair_counts(present_rel, r1, r2, head)
-    support_prev, pca_prev = _pair_counts(previous, r1, r2, head)
-    head_delta = sum(1 for edge in added_in_graph if edge[1] == head) - sum(
-        1 for edge in removed_set if edge[1] == head
+
+def _head_delta(added_in_graph: set[Edge], removed: set[Edge], head: str) -> int:
+    return sum(1 for _src, rel, _dst in added_in_graph if rel == head) - sum(
+        1 for _src, rel, _dst in removed if rel == head
     )
-    return (support_now - support_prev, pca_now - pca_prev, head_delta)
 
 
 def _pair_counts(edges: set[Edge], r1: str, r2: str, head: str) -> tuple[int, int]:
@@ -62,6 +117,37 @@ def _pair_counts(edges: set[Edge], r1: str, r2: str, head: str) -> tuple[int, in
 
     head_pairs = {(src, dst) for (rel, src), dsts in outgoing.items() if rel == head for dst in dsts}
     head_sources = {src for rel, src in outgoing if rel == head}
+    support = len(body_pairs & head_pairs)
+    pca = sum(1 for src, _dst in body_pairs if src in head_sources)
+    return support, pca
+
+
+def _triple_counts(
+    edges: set[Edge],
+    r1: str,
+    r2: str,
+    r3: str,
+    head: str,
+) -> tuple[int, int]:
+    by_src_rel: dict[tuple[str, str], list[Edge]] = defaultdict(list)
+    for edge in edges:
+        by_src_rel[(edge[1], edge[0])].append(edge)
+
+    body_pairs: set[tuple[str, str]] = set()
+    for first in edges:
+        if first[1] != r1:
+            continue
+        source, _, mid = first
+        for second in by_src_rel.get((r2, mid), ()):
+            if second == first:
+                continue
+            for third in by_src_rel.get((r3, second[2]), ()):
+                if third == first or third == second:
+                    continue
+                body_pairs.add((source, third[2]))
+
+    head_pairs = {(src, dst) for src, rel, dst in edges if rel == head}
+    head_sources = {src for src, rel, _dst in edges if rel == head}
     support = len(body_pairs & head_pairs)
     pca = sum(1 for src, _dst in body_pairs if src in head_sources)
     return support, pca
