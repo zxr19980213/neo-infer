@@ -53,74 +53,74 @@ class TriggerManager:
         # Uses apoc.trigger.install and tx metadata guard:
         # - Skip system writes tagged by app (skip_changelog=true).
         # - Skip writes touching ChangeLog / internal state labels to avoid self-loop.
-        # NOTE:
-        # - Some APOC versions do not expose apoc.trigger.toRelationship.
-        # - To stay compatible and avoid DETACH DELETE failures, deleted-relationship
-        #   handling below records relationship-level removals without dereferencing
-        #   start/end nodes.
         return f"""
         WITH $createdRelationships AS createdRels,
-             $deletedRelationships AS deletedRels,
-             coalesce($transactionId, -1) AS txId,
              coalesce($metaData,{{}}) AS meta
         WHERE coalesce(meta.skip_changelog, false) = false
         WITH [rel IN createdRels
               WHERE NOT any(lbl IN labels(startNode(rel)) WHERE lbl IN [{labels}])
-                AND NOT any(lbl IN labels(endNode(rel)) WHERE lbl IN [{labels}])] AS createdFiltered,
-             deletedRels,
-             txId
-        CALL {{
-          WITH createdFiltered
-          UNWIND createdFiltered AS rel
-          MERGE (c:ChangeLog {{dedup_key: "trigger|add|" + elementId(rel)}})
-          ON CREATE SET c.event_type = "added",
-                        c.src = coalesce(startNode(rel).id, elementId(startNode(rel))),
-                        c.rel = type(rel),
-                        c.dst = coalesce(endNode(rel).id, elementId(endNode(rel))),
-                        c.is_inferred = coalesce(rel.is_inferred, false),
-                        c.source = "trigger",
-                        c.batch_id = "trigger",
-                        c.idempotency_key = "trigger",
-                        c.created_at = datetime()
-          RETURN count(*) AS created_count
-        }}
-        CALL {{
-          WITH deletedRels, txId
-          UNWIND range(0, size(deletedRels) - 1) AS idx
-          WITH deletedRels[idx] AS rel, txId, idx
-          WITH rel, idx,
-               coalesce(elementId(rel), toString(txId) + "|" + toString(idx)) AS relElementId,
-               coalesce(type(rel), "__deleted__") AS relType
-          MERGE (c:ChangeLog {{
-            dedup_key: "trigger|del|" + relElementId
-          }})
-          ON CREATE SET c.event_type = "removed",
-                        c.src = "deleted:" + relElementId,
-                        c.rel = relType,
-                        c.dst = "deleted:" + relElementId,
-                        c.is_inferred = coalesce(rel.is_inferred, false),
-                        c.source = "trigger",
-                        c.batch_id = "trigger",
-                        c.idempotency_key = "trigger",
-                        c.created_at = datetime()
-          RETURN count(*) AS removed_count
-        }}
-        RETURN 1 AS ok
+                AND NOT any(lbl IN labels(endNode(rel)) WHERE lbl IN [{labels}])] AS createdFiltered
+        UNWIND createdFiltered AS rel
+        MERGE (c:ChangeLog {{dedup_key: "trigger|add|" + elementId(rel)}})
+        ON CREATE SET c.event_type = "added",
+                      c.src = coalesce(startNode(rel).id, elementId(startNode(rel))),
+                      c.rel = type(rel),
+                      c.dst = coalesce(endNode(rel).id, elementId(endNode(rel))),
+                      c.is_inferred = coalesce(rel.is_inferred, false),
+                      c.source = "trigger",
+                      c.batch_id = "trigger",
+                      c.idempotency_key = "trigger",
+                      c.created_at = datetime()
+        RETURN count(*) AS ok
+        """
+
+    def _delete_trigger_name(self) -> str:
+        return f"{self._trigger_name}_delete"
+
+    def _delete_trigger_statement(self) -> str:
+        labels = ",".join(f'"{item}"' for item in self.INTERNAL_LABELS)
+        # before-phase still has the deleted relationship's endpoints.
+        return f"""
+        WITH $deletedRelationships AS deletedRels,
+             coalesce($metaData,{{}}) AS meta
+        WHERE coalesce(meta.skip_changelog, false) = false
+        UNWIND deletedRels AS rel
+        WITH rel
+        WHERE NOT any(lbl IN labels(startNode(rel)) WHERE lbl IN [{labels}])
+          AND NOT any(lbl IN labels(endNode(rel)) WHERE lbl IN [{labels}])
+        MERGE (c:ChangeLog {{dedup_key: "trigger|del|" + elementId(rel)}})
+        ON CREATE SET c.event_type = "removed",
+                      c.src = coalesce(startNode(rel).id, elementId(startNode(rel))),
+                      c.rel = type(rel),
+                      c.dst = coalesce(endNode(rel).id, elementId(endNode(rel))),
+                      c.is_inferred = coalesce(rel.is_inferred, false),
+                      c.source = "trigger",
+                      c.batch_id = "trigger",
+                      c.idempotency_key = "trigger",
+                      c.created_at = datetime()
+        RETURN count(*) AS ok
         """
 
     def upsert_trigger(self) -> bool:
         statement = self._trigger_statement()
+        delete_statement = self._delete_trigger_statement()
         self.drop_trigger()
+        created = self._install_trigger(self._trigger_name, statement, "afterAsync")
+        deleted = self._install_trigger(self._delete_trigger_name(), delete_statement, "before")
+        return created or deleted
+
+    def _install_trigger(self, name: str, statement: str, phase: str) -> bool:
         # Neo4j 5+ APOC style.
         try:
             rows = self._db.run_write(
                 """
-                CALL apoc.trigger.install($database, $name, $statement, {}, {phase: "afterAsync"})
+                CALL apoc.trigger.install($database, $name, $statement, {}, {phase: $phase})
                 """,
                 {
                     "database": self._db.settings.neo4j_database,
-                    "name": self._trigger_name,
+                    "name": name,
                     "statement": statement,
+                    "phase": phase,
                 },
                 database="system",
             )
@@ -133,11 +133,12 @@ class TriggerManager:
         try:
             rows = self._db.run_write(
                 """
-                CALL apoc.trigger.add($name, $statement, {}, {phase: "afterAsync"})
+                CALL apoc.trigger.add($name, $statement, {}, {phase: $phase})
                 """,
                 {
-                    "name": self._trigger_name,
+                    "name": name,
                     "statement": statement,
+                    "phase": phase,
                 },
                 database="system",
             )
@@ -247,6 +248,12 @@ class TriggerManager:
         return rows
 
     def drop_trigger(self) -> bool:
+        dropped = False
+        for name in (self._trigger_name, self._delete_trigger_name()):
+            dropped = self._drop_named_trigger(name) or dropped
+        return dropped
+
+    def _drop_named_trigger(self, name: str) -> bool:
         # Neo4j 5+ APOC style.
         try:
             self._db.run_write(
@@ -255,7 +262,7 @@ class TriggerManager:
                 """,
                 {
                     "database": self._db.settings.neo4j_database,
-                    "name": self._trigger_name,
+                    "name": name,
                 },
                 database="system",
             )
@@ -268,7 +275,7 @@ class TriggerManager:
                 """
                 CALL apoc.trigger.remove($name)
                 """,
-                {"name": self._trigger_name},
+                {"name": name},
                 database="system",
             )
             return True

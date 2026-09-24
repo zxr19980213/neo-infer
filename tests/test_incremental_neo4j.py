@@ -18,13 +18,14 @@ from neo4j.exceptions import ServiceUnavailable
 from neo_infer.api import ensure_neo4j_schema
 from neo_infer.config import Settings
 from neo_infer.db import Neo4jClient
-from neo_infer.incremental_counters import length2_stat_delta, length3_stat_delta
+from neo_infer.incremental_counters import length2_stat_delta, length3_stat_delta, length_n_stat_delta
 from neo_infer.incremental_mining import IncrementalMiningService
+from neo_infer.inference import InferenceEngine
 from neo_infer.incremental_store import IncrementalStore
 from neo_infer.models import ChangeEdge, MineRulesRequest, Rule, build_rule_id
 from neo_infer.query import QueryRepository
 from neo_infer.rule_management import RuleStore
-from neo_infer.rule_mining import RuleMiningService
+from neo_infer.rule_mining import MiningConfig, RuleMiningService
 
 _REL = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 BORN = "ItBornIn"
@@ -76,6 +77,15 @@ class LiveGraph:
     def reset(self) -> None:
         self.client.run_write("MATCH (n:ItEntity) DETACH DELETE n")
         self.client.run_write("MATCH (c:ChangeLog) WHERE c.source = 'it' DETACH DELETE c")
+        self.client.run_write(
+            """
+            MATCH (r:Rule)
+            WHERE r.head_relation STARTS WITH 'It'
+               OR any(rel IN coalesce(r.body_relations, []) WHERE rel STARTS WITH 'It')
+            OPTIONAL MATCH (s:RuleStat {rule_id: r.rule_id})
+            DETACH DELETE r, s
+            """
+        )
         tip = self.client.run_read("MATCH (c:ChangeLog) RETURN max(toInteger(c.change_seq)) AS seq")
         seq = int(tip[0]["seq"] or 0) if tip else 0
         self.store.set_cursor(seq)
@@ -167,6 +177,23 @@ class LiveGraph:
                 r1=body[0],
                 r2=body[1],
                 r3=body[2],
+                head=head,
+                present=present,
+                added=added_tuples,
+                removed=removed_tuples,
+            )
+        elif len(body) >= 4 and keys:
+            present = {
+                (src, rel, dst)
+                for src, rel, dst in self.repo.lengthN_neighborhood_edges(
+                    list(body),
+                    head,
+                    keys,
+                    factual_only=factual_only,
+                )
+            }
+            delta = length_n_stat_delta(
+                body=list(body),
                 head=head,
                 present=present,
                 added=added_tuples,
@@ -786,6 +813,31 @@ def test_length3_recompute_respects_factual_only(graph: LiveGraph):
     assert stored.support == included["support"] == 2
 
 
+def test_length2_mines_branch_and_constant_rules(graph: LiveGraph):
+    parent = "ItParent"
+    sibling = "ItSibling"
+    graph.add("it-bob", parent, "it-alice")
+    graph.add("it-bob", parent, "it-carol")
+    graph.add("it-alice", sibling, "it-carol")
+    graph.add("it-alice", BORN, "it-beijing")
+    graph.add("it-beijing", LOC, "it-china")
+    graph.add("it-alice", NAT, "it-china")
+    graph.add("it-bob2", BORN, "it-beijing")
+    graph.add("it-bob2", NAT, "it-china")
+    rules = RuleMiningService(graph.repo).mine_length2_rules(
+        MiningConfig(
+            min_support=1,
+            min_pca_confidence=0.1,
+            top_k=50,
+            candidate_limit=50,
+            body_length=2,
+        )
+    )
+    bodies = {rule.body_relations for rule in rules}
+    assert (f"^{parent}", parent) in bodies
+    assert (f"{BORN}@it-beijing", LOC) in bodies
+
+
 def test_missing_baseline_falls_back_to_full_recount(graph: LiveGraph):
     body = (BORN, LOC)
     head = NAT
@@ -808,3 +860,159 @@ def test_missing_baseline_falls_back_to_full_recount(graph: LiveGraph):
     assert stored.support == full["support"]
     assert stored.pca_denominator == full["pca_denominator"]
     assert stored.head_count == full["head_count"]
+
+
+def _edge_owner(graph: LiveGraph, src: str, rel: str, dst: str) -> str | None:
+    rows = graph.client.run_read(
+        f"""
+        MATCH (a:ItEntity {{id: $src}})-[r:`{rel}`]->(b:ItEntity {{id: $dst}})
+        RETURN r.source_rule_id AS owner, coalesce(r.is_inferred, false) AS inferred
+        """,
+        {"src": src, "dst": dst},
+    )
+    if not rows:
+        return None
+    return str(rows[0]["owner"]) if rows[0]["inferred"] else ""
+
+
+def _adopt(graph: LiveGraph, body: tuple[str, ...], head: str) -> Rule:
+    rule = Rule(
+        rule_id=build_rule_id(body, head),
+        body_relations=body,
+        head_relation=head,
+        support=1,
+        pca_confidence=1.0,
+        head_coverage=1.0,
+        status="discovered",
+        version=1,
+    )
+    graph.rules.upsert_rules([rule])
+    graph.rules.transition_rule_status(rule.rule_id, "adopted")
+    return rule
+
+
+def test_retract_unsupported_edge_and_other_rule_recreates_it(graph: LiveGraph):
+    works = "ItWorksIn"
+    based = "ItBasedIn"
+    graph.add("it-alice", BORN, "it-beijing")
+    graph.add("it-beijing", LOC, "it-china")
+    graph.add("it-alice", works, "it-acme")
+    graph.add("it-acme", based, "it-china")
+    born_rule = _adopt(graph, (BORN, LOC), NAT)
+    engine = InferenceEngine(graph.repo, graph.rules)
+    engine.run_once(check_conflicts=False)
+    assert _edge_owner(graph, "it-alice", NAT, "it-china") == born_rule.rule_id
+
+    graph.remove("it-beijing", LOC, "it-china")
+    engine.run_once(check_conflicts=False)
+    assert _edge_owner(graph, "it-alice", NAT, "it-china") is None
+
+    graph.add("it-beijing", LOC, "it-china")
+    engine.run_once(check_conflicts=False)
+    assert _edge_owner(graph, "it-alice", NAT, "it-china") == born_rule.rule_id
+    work_rule = _adopt(graph, (works, based), NAT)
+    graph.remove("it-beijing", LOC, "it-china")
+    engine.run_once(check_conflicts=False)
+    assert _edge_owner(graph, "it-alice", NAT, "it-china") == work_rule.rule_id
+
+
+def test_conflict_relation_blocks_inferred_head(graph: LiveGraph):
+    blocked = "ItNoNationality"
+    graph.add("it-alice", BORN, "it-beijing")
+    graph.add("it-beijing", LOC, "it-china")
+    graph.add("it-alice", blocked, "it-china")
+    graph.add("it-bob", BORN, "it-shanghai")
+    graph.add("it-shanghai", LOC, "it-china")
+    _adopt(graph, (BORN, LOC), NAT)
+    engine = InferenceEngine(
+        graph.repo,
+        graph.rules,
+        conflict_pairs={NAT: {blocked}},
+    )
+    summary = engine.run_once(check_conflicts=True)
+    assert _edge_owner(graph, "it-alice", NAT, "it-china") is None
+    assert _edge_owner(graph, "it-bob", NAT, "it-china") is not None
+    assert summary.conflicts_detected >= 1
+
+
+def test_remove_without_flag_reads_is_inferred_from_the_graph(graph: LiveGraph):
+    graph.add("it-bob", BORN, "it-shanghai", inferred=True)
+    graph.append([], [ChangeEdge(src="it-bob", rel=BORN, dst="it-shanghai", is_inferred=False)])
+    delta = graph.store.consume_delta()
+    assert len(delta.removed_edges) == 1
+    assert delta.removed_edges[0].is_inferred is True
+    graph.store.mark_consumed(delta.cursor)
+
+
+H1 = "ItHopA"
+H2 = "ItHopB"
+H3 = "ItHopC"
+H4 = "ItHopD"
+HHEAD = "ItHopHead"
+
+
+def test_length4_event_deltas_match_full_recount(graph: LiveGraph):
+    body = (H1, H2, H3, H4)
+    head = HHEAD
+    graph.add("it-a", H1, "it-b")
+    graph.add("it-b", H2, "it-c")
+    graph.add("it-c", H3, "it-d")
+    graph.add("it-d", H4, "it-e")
+    graph.add("it-a", head, "it-e")
+    current = graph.metrics(body, head, factual_only=True)
+    assert current == {"support": 1, "pca_denominator": 1, "head_count": 1}
+
+    current = graph.assert_delta(
+        body, head, current,
+        added=[graph.add("it-x", H2, "it-y")],
+        removed=[],
+        factual_only=True,
+    )
+    assert current["support"] == 1
+
+    current = graph.assert_delta(
+        body, head, current,
+        added=[
+            graph.add("it-p", H1, "it-q"),
+            graph.add("it-q", H2, "it-r"),
+            graph.add("it-r", H3, "it-s"),
+            graph.add("it-s", H4, "it-t"),
+        ],
+        removed=[],
+        factual_only=True,
+    )
+    assert current["support"] == 1
+    current = graph.assert_delta(
+        body, head, current,
+        added=[graph.add("it-p", head, "it-t")],
+        removed=[],
+        factual_only=True,
+    )
+    assert current == {"support": 2, "pca_denominator": 2, "head_count": 2}
+
+    current = graph.assert_delta(
+        body, head, current,
+        added=[
+            graph.add("it-p", H1, "it-q2"),
+            graph.add("it-q2", H2, "it-r2"),
+            graph.add("it-r2", H3, "it-s2"),
+            graph.add("it-s2", H4, "it-t"),
+        ],
+        removed=[],
+        factual_only=True,
+    )
+    assert current["support"] == 2
+    current = graph.assert_delta(
+        body, head, current,
+        added=[],
+        removed=[graph.remove("it-q", H2, "it-r")],
+        factual_only=True,
+    )
+    assert current["support"] == 2
+    current = graph.assert_delta(
+        body, head, current,
+        added=[],
+        removed=[graph.remove("it-s2", H4, "it-t")],
+        factual_only=True,
+    )
+    assert current["support"] == 1

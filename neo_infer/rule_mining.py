@@ -16,6 +16,8 @@ class MiningConfig:
     candidate_limit: int = 2000
     body_length: int = 2
     changed_relations: list[str] | None = None
+    changed_node_keys: list[str] | None = None
+    fanout_cap: int | None = None
     factual_only: bool = True
     # AMIE+ search-space controls:
     # - beam_width: keep top-B body candidates per expansion level.
@@ -38,9 +40,11 @@ class RuleMiningService:
             return method(**kwargs)
         except TypeError:
             # Backward-compatible fallback for stub/legacy repos that don't accept new kwargs.
-            if "factual_only" in kwargs:
+            if "factual_only" in kwargs or "changed_node_keys" in kwargs or "fanout_cap" in kwargs:
                 fallback = dict(kwargs)
                 fallback.pop("factual_only", None)
+                fallback.pop("changed_node_keys", None)
+                fallback.pop("fanout_cap", None)
                 return method(**fallback)
             raise
 
@@ -174,15 +178,9 @@ class RuleMiningService:
         body_pairs: list[tuple[str, str]],
         support_map: dict[tuple[str, str], int],
     ) -> list[tuple[str, str]]:
-        # Keep one representative for same (first relation, support) bucket.
-        buckets: dict[tuple[str, int], list[tuple[str, str]]] = defaultdict(list)
-        for pair in body_pairs:
-            buckets[(pair[0], int(support_map.get(pair, 0)))].append(pair)
-        kept: list[tuple[str, str]] = []
-        for items in buckets.values():
-            items_sorted = sorted(items, key=lambda x: (x[1], x[0]))
-            kept.append(items_sorted[0])
-        return sorted(kept)
+        # Distinct body pairs are different rules. Only exact duplicates are redundant.
+        _ = support_map
+        return sorted(set(body_pairs))
 
     @staticmethod
     def _prune_non_improving_length3_bodies(
@@ -358,15 +356,15 @@ class RuleMiningService:
             }
 
         for candidate in candidates:
-            support = max(1, int(candidate.support))
+            support = max(0, int(candidate.support))
             denom_lb = max(1, int(candidate.pca_denominator))
-            effective_denom = denom_lb
-            if weight > 0.0:
+            if weight > 0.0 and support > 0:
                 local_ratio = max(1.0, float(ratio_by_head.get(candidate.head_relation, 1.0)))
-                local_expected = int(round(float(support) * local_ratio))
-                blended = int(round((1.0 - weight) * float(denom_lb) + weight * float(local_expected)))
-                effective_denom = max(denom_lb, max(1, blended))
-            upper_bound = float(candidate.support) / float(effective_denom)
+                local_expected = max(1, int(round(float(support) * local_ratio)))
+                optimistic_denom = max(1, min(denom_lb, local_expected))
+                upper_bound = float(support) / float(optimistic_denom)
+            else:
+                upper_bound = float(support) / float(denom_lb)
             if upper_bound < min_confidence:
                 continue
             pruned.append(candidate)
@@ -377,9 +375,10 @@ class RuleMiningService:
         # AMIE dangling step (len-2): enumerate body candidates first, then close to head.
         bodies = self._repo_call(
             "length2_body_candidates",
-            limit=config.candidate_limit,
+            limit=config.candidate_limit if not config.fanout_cap else min(config.candidate_limit, config.fanout_cap),
             affected_relations=config.changed_relations,
             factual_only=config.factual_only,
+            changed_node_keys=config.changed_node_keys,
         )
         body_pairs, support_map = self._support_prune_length2_bodies(bodies, config.min_support)
         body_pairs = self._redundancy_prune_length2_bodies(body_pairs, support_map)
@@ -392,6 +391,7 @@ class RuleMiningService:
             limit=config.candidate_limit,
             factual_only=config.factual_only,
         )
+        raw_candidates = self._with_extended_length2_candidates(list(raw_candidates), config)
         raw_candidates = self._dedup_by_signature(raw_candidates)
         raw_candidates = self._prune_low_confidence_upper_bound(
             raw_candidates,
@@ -404,6 +404,18 @@ class RuleMiningService:
             factual_only=config.factual_only,
         )
         return self._to_rules_from_candidates(raw_candidates, head_counts, config)
+
+    def _with_extended_length2_candidates(self, raw_candidates: list, config: MiningConfig) -> list:
+        if not hasattr(self._repository, "length2_extended_rule_candidates"):
+            return raw_candidates
+        extra = self._repo_call(
+            "length2_extended_rule_candidates",
+            limit=config.candidate_limit,
+            affected_relations=config.changed_relations,
+            factual_only=config.factual_only,
+            min_support=config.min_support,
+        )
+        return [*raw_candidates, *list(extra or [])]
 
     def build_rules_from_relation_triples(
         self,
@@ -474,6 +486,7 @@ class RuleMiningService:
             limit=config.candidate_limit,
             affected_relations=normalized,
             factual_only=config.factual_only,
+            changed_node_keys=config.changed_node_keys,
         )
         body_pairs, support_map = self._support_prune_length2_bodies(bodies, config.min_support)
         body_pairs = self._redundancy_prune_length2_bodies(body_pairs, support_map)
@@ -486,6 +499,7 @@ class RuleMiningService:
             limit=config.candidate_limit,
             factual_only=config.factual_only,
         )
+        raw_candidates = self._with_extended_length2_candidates(list(raw_candidates), config)
         raw_candidates = self._dedup_by_signature(raw_candidates)
         raw_candidates = self._prune_low_confidence_upper_bound(
             raw_candidates,
@@ -518,6 +532,7 @@ class RuleMiningService:
             limit=config.candidate_limit,
             affected_relations=normalized,
             factual_only=config.factual_only,
+            changed_node_keys=config.changed_node_keys,
         )
         prefixes, prefix_support_map = self._support_prune_length2_bodies(prefix_bodies, config.min_support)
         prefixes = self._redundancy_prune_length2_bodies(prefixes, prefix_support_map)
@@ -560,13 +575,20 @@ class RuleMiningService:
     def mine_lengthN_rules(self, config: MiningConfig) -> list[Rule]:
         """Mine rules for body length > 3 using generic candidate enumeration."""
         self._factual_only = bool(config.factual_only)
+        limit = config.candidate_limit
+        if config.fanout_cap and config.fanout_cap > 0:
+            limit = min(limit, config.fanout_cap)
         candidates = self._repository.lengthN_path_rule_candidates(
             n=config.body_length,
-            limit=config.candidate_limit,
+            limit=limit,
             affected_relations=config.changed_relations,
             factual_only=config.factual_only,
         )
         candidates = self._dedup_by_signature(candidates)
+        if config.beam_width and config.beam_width > 0:
+            candidates = sorted(candidates, key=lambda item: (-int(item.support), item.body_relations))[
+                : config.beam_width
+            ]
         candidates = self._prune_low_confidence_upper_bound(
             candidates,
             config.min_pca_confidence,
@@ -590,6 +612,7 @@ class RuleMiningService:
             limit=config.candidate_limit,
             affected_relations=config.changed_relations,
             factual_only=config.factual_only,
+            changed_node_keys=config.changed_node_keys,
         )
         prefixes, prefix_support_map = self._support_prune_length2_bodies(prefix_bodies, config.min_support)
         prefixes = self._redundancy_prune_length2_bodies(prefixes, prefix_support_map)

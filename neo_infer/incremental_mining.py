@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from neo_infer.incremental_counters import Edge, length2_stat_delta, length3_stat_delta
+from neo_infer.incremental_counters import Edge, length2_stat_delta, length3_stat_delta, length_n_stat_delta
 from neo_infer.incremental_store import IncrementalStore
 from neo_infer.models import ChangeEdge, MineRulesRequest, Rule
 from neo_infer.rule_management import RuleStore
@@ -203,6 +203,54 @@ class IncrementalMiningService:
             "head_count": max(0, int(stat.head_count) + delta_head),
         }
 
+    def _length_n_event_metrics(
+        self,
+        rule: Rule,
+        *,
+        added_edges: list[ChangeEdge],
+        removed_edges: list[ChangeEdge],
+        factual_only: bool,
+        fanout_cap: int | None,
+    ) -> dict[str, int] | None:
+        if len(rule.body_relations) < 4:
+            return None
+        repo = self.miner._repository
+        if not hasattr(repo, "lengthN_neighborhood_edges"):
+            return None
+        stat = self.incremental_store.get_rule_stat(rule.rule_id)
+        if stat is None:
+            return None
+        body = list(rule.body_relations)
+        head = rule.head_relation
+        relevant = {*body, head}
+
+        def _counts(edge: ChangeEdge) -> bool:
+            return edge.rel in relevant and not (factual_only and edge.is_inferred)
+
+        added = [edge for edge in added_edges if _counts(edge)]
+        removed = [edge for edge in removed_edges if _counts(edge)]
+        if not added and not removed:
+            return {
+                "support": int(stat.support),
+                "pca_denominator": int(stat.pca_denominator),
+                "head_count": int(stat.head_count),
+            }
+        node_keys = [item for edge in (*added, *removed) for item in (edge.src, edge.dst)]
+        present_rows = repo.lengthN_neighborhood_edges(
+            body, head, node_keys, factual_only=factual_only, fanout_cap=fanout_cap,
+        )
+        present: set[Edge] = {(str(src), str(rel), str(dst)) for src, rel, dst in present_rows}
+        delta_support, delta_pca, delta_head = length_n_stat_delta(
+            body=body, head=head, present=present,
+            added=[(edge.src, edge.rel, edge.dst) for edge in added],
+            removed=[(edge.src, edge.rel, edge.dst) for edge in removed],
+        )
+        return {
+            "support": max(0, int(stat.support) + delta_support),
+            "pca_denominator": max(0, int(stat.pca_denominator) + delta_pca),
+            "head_count": max(0, int(stat.head_count) + delta_head),
+        }
+
     def _update_existing_rules_by_delta(
         self,
         *,
@@ -240,6 +288,14 @@ class IncrementalMiningService:
                         added_edges=added_edges,
                         removed_edges=removed_edges,
                         factual_only=factual_only,
+                    )
+                elif body_length > 3:
+                    metrics = self._length_n_event_metrics(
+                        rule,
+                        added_edges=added_edges,
+                        removed_edges=removed_edges,
+                        factual_only=factual_only,
+                        fanout_cap=getattr(self, "_fanout_cap", None),
                     )
             if metrics is None:
                 metrics = self._full_metrics(rule, factual_only=factual_only)
@@ -280,6 +336,12 @@ class IncrementalMiningService:
                 affected_relations=[],
             )
 
+        node_keys = [
+            item
+            for edge in events
+            for item in (edge.src, edge.dst)
+            if item and not str(item).startswith("deleted:")
+        ]
         config = MiningConfig(
             min_support=request.min_support if request.min_support is not None else 0,
             min_pca_confidence=request.min_pca_confidence if request.min_pca_confidence is not None else 0.0,
@@ -292,9 +354,12 @@ class IncrementalMiningService:
             confidence_ub_weight=request.confidence_ub_weight,
             body_length=body_length,
             changed_relations=affected_relations,
+            changed_node_keys=list(dict.fromkeys(node_keys)),
+            fanout_cap=getattr(request, "fanout_cap", None),
         )
 
         self._pending_exact_stats = {}
+        self._fanout_cap = getattr(request, "fanout_cap", None)
         updated_existing = self._update_existing_rules_by_delta(
             affected_relations=affected_relations,
             body_length=body_length,

@@ -771,7 +771,14 @@ def adopt_rule(rule_id: str, db: Neo4jClient = Depends(get_db)) -> dict[str, str
 @app.post("/rules/{rule_id}/reject")
 def reject_rule(rule_id: str, db: Neo4jClient = Depends(get_db)) -> dict[str, str]:
     try:
-        new_status = RuleStore(db).transition_rule_status(rule_id, "rejected")
+        store = RuleStore(db)
+        rule = next((item for item in store.list_rules(limit=10000) if item.rule_id == rule_id), None)
+        new_status = store.transition_rule_status(rule_id, "rejected")
+        if rule is not None:
+            repo = QueryRepository(db.driver, database=get_settings().neo4j_database)
+            retract = getattr(repo, "retract_rule_edges", None)
+            if retract is not None:
+                retract(rule.rule_id)
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Rule '{rule_id}' not found")
     except InvalidStatusTransition as exc:

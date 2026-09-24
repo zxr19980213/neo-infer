@@ -70,6 +70,7 @@ class IncrementalStore:
                 }
             )
             seq += 1
+        removed_edges = self._with_inferred_flags(list(removed_edges))
         for edge in removed_edges:
             dedup_key = f"{dedup_prefix}|removed|{edge.src}|{edge.rel}|{edge.dst}|{seq}"
             payload.append(
@@ -131,6 +132,36 @@ class IncrementalStore:
             SET counter.next_seq = toInteger(counter.next_seq) + assigned
             """,
         )
+
+    def _with_inferred_flags(self, edges: list[ChangeEdge]) -> list[ChangeEdge]:
+        """Copy is_inferred from the live relationship when the event omitted it."""
+        pending = [edge for edge in edges if not edge.is_inferred]
+        if not pending:
+            return edges
+        rows = self._client.run_read(
+            """
+            UNWIND $edges AS edge
+            MATCH (a)-[r]->(b)
+            WHERE type(r) = edge.rel
+              AND (a.id = edge.src OR elementId(a) = edge.src)
+              AND (b.id = edge.dst OR elementId(b) = edge.dst)
+              AND coalesce(r.is_inferred, false) = true
+            RETURN edge.src AS src, edge.rel AS rel, edge.dst AS dst
+            """,
+            {
+                "edges": [{"src": edge.src, "rel": edge.rel, "dst": edge.dst} for edge in pending],
+            },
+        )
+        inferred = {(str(row["src"]), str(row["rel"]), str(row["dst"])) for row in rows}
+        if not inferred:
+            return edges
+        marked: list[ChangeEdge] = []
+        for edge in edges:
+            if (edge.src, edge.rel, edge.dst) in inferred:
+                marked.append(edge.model_copy(update={"is_inferred": True}))
+            else:
+                marked.append(edge)
+        return marked
 
     def append_changelog(self, batch: EdgeDeltaBatch) -> tuple[int, int, int]:
         self.append_changes(batch.added_edges, batch.removed_edges)

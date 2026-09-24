@@ -232,12 +232,17 @@ class QueryRepository:
         limit: int = 5000,
         affected_relations: list[str] | None = None,
         factual_only: bool = True,
+        changed_node_keys: list[str] | None = None,
     ) -> list[tuple[str, str, int]]:
         rels = [item.strip().replace("`", "") for item in (affected_relations or []) if item.strip()]
+        node_keys = [item for item in (changed_node_keys or []) if item]
         query = """
         MATCH (x)-[a]->(z)-[b]->(y)
-        WHERE (NOT $factual_only)
-           OR (coalesce(a.is_inferred, false) = false AND coalesce(b.is_inferred, false) = false)
+        WHERE ((NOT $factual_only)
+           OR (coalesce(a.is_inferred, false) = false AND coalesce(b.is_inferred, false) = false))
+          AND (size($node_keys) = 0 OR any(k IN $node_keys WHERE
+            x.id = k OR elementId(x) = k OR z.id = k OR elementId(z) = k
+            OR y.id = k OR elementId(y) = k))
         WITH type(a) AS r1, type(b) AS r2, collect(DISTINCT [x, y]) AS pairs
         WHERE size($rels) = 0 OR r1 IN $rels OR r2 IN $rels
         RETURN r1, r2, size(pairs) AS body_support
@@ -245,7 +250,12 @@ class QueryRepository:
         LIMIT $limit
         """
         with self._driver.session(database=self._database) as session:
-            rows = list(session.run(query, {"rels": rels, "limit": int(limit), "factual_only": factual_only}))
+            rows = list(session.run(query, {
+                "rels": rels,
+                "limit": int(limit),
+                "factual_only": factual_only,
+                "node_keys": node_keys,
+            }))
             return [(str(row["r1"]), str(row["r2"]), int(row["body_support"])) for row in rows]
 
     def length3_body_candidates(
@@ -332,6 +342,91 @@ class QueryRepository:
                 for record in phase1_records
             ]
 
+    def length2_extended_rule_candidates(
+        self,
+        limit: int = 5000,
+        affected_relations: list[str] | None = None,
+        factual_only: bool = True,
+        min_support: int = 1,
+    ) -> list[PathRuleCandidate]:
+        """Branching paths and constant instantiations of the join node.
+
+        Branching uses a backward hop, written with a leading ``^``. A constant
+        join is written ``rel@nodeId``. Plain forward chains stay in the
+        existing length-2 search.
+        """
+        rels = [item.strip().replace("`", "") for item in (affected_relations or []) if item.strip()]
+        factual = """
+          AND ((NOT $factual_only)
+            OR (coalesce(a.is_inferred, false) = false AND coalesce(b.is_inferred, false) = false))
+        """
+        head_factual = "AND ((NOT $factual_only) OR coalesce(h.is_inferred, false) = false)"
+        patterns = [
+            (
+                f"""
+                MATCH (x)-[a]->(z)<-[b]-(y)
+                WHERE elementId(x) <> elementId(y) {factual}
+                MATCH (x)-[h]->(y)
+                WHERE true {head_factual}
+                RETURN type(a) AS r1, '^' + type(b) AS r2, type(h) AS head,
+                       count(DISTINCT [x, y]) AS support
+                """,
+            ),
+            (
+                f"""
+                MATCH (x)<-[a]-(z)-[b]->(y)
+                WHERE elementId(x) <> elementId(y) {factual}
+                MATCH (x)-[h]->(y)
+                WHERE true {head_factual}
+                RETURN '^' + type(a) AS r1, type(b) AS r2, type(h) AS head,
+                       count(DISTINCT [x, y]) AS support
+                """,
+            ),
+            (
+                f"""
+                MATCH (x)<-[a]-(z)<-[b]-(y)
+                WHERE elementId(x) <> elementId(y) {factual}
+                MATCH (x)-[h]->(y)
+                WHERE true {head_factual}
+                RETURN '^' + type(a) AS r1, '^' + type(b) AS r2, type(h) AS head,
+                       count(DISTINCT [x, y]) AS support
+                """,
+            ),
+            (
+                f"""
+                MATCH (x)-[a]->(z)-[b]->(y)
+                WHERE z.id IS NOT NULL {factual}
+                MATCH (x)-[h]->(y)
+                WHERE true {head_factual}
+                RETURN type(a) + '@' + z.id AS r1, type(b) AS r2, type(h) AS head,
+                       count(DISTINCT [x, y]) AS support
+                """,
+            ),
+        ]
+        found: list[PathRuleCandidate] = []
+        with self._driver.session(database=self._database) as session:
+            for (statement,) in patterns:
+                rows = session.run(statement, {"factual_only": factual_only})
+                for row in rows:
+                    r1, r2, head = str(row["r1"]), str(row["r2"]), str(row["head"])
+                    support = int(row["support"])
+                    if support < min_support:
+                        continue
+                    plain = [self._split_atom(r1)[1], self._split_atom(r2)[1]]
+                    if rels and not any(item in rels for item in plain):
+                        continue
+                    metrics = self.compute_pattern_rule_metrics((r1, r2), head, factual_only=factual_only)
+                    found.append(
+                        PathRuleCandidate(
+                            body_relations=(r1, r2),
+                            head_relation=head,
+                            support=int(metrics["support"]),
+                            pca_denominator=int(metrics["pca_denominator"]),
+                        )
+                    )
+        found.sort(key=lambda item: item.support, reverse=True)
+        return found[:limit]
+
     def length3_path_rule_candidates_for_bodies(
         self,
         body_triples: list[tuple[str, str, str]],
@@ -391,6 +486,8 @@ class QueryRepository:
         head_rel: str,
         factual_only: bool = True,
     ) -> dict[str, int]:
+        if not self._atom_is_plain(r1) or not self._atom_is_plain(r2):
+            return self.compute_pattern_rule_metrics((r1, r2), head_rel, factual_only=factual_only)
         query = """
         CALL () {
           MATCH (x)-[a]->(z)-[b]->(y)
@@ -418,7 +515,7 @@ class QueryRepository:
           MATCH ()-[h]->()
           WHERE type(h) = $head_rel
             AND ((NOT $factual_only) OR coalesce(h.is_inferred, false) = false)
-          RETURN count(h) AS head_count
+          RETURN count(DISTINCT [startNode(h), endNode(h)]) AS head_count
         }
         RETURN support, pca_denominator, head_count
         """
@@ -427,6 +524,49 @@ class QueryRepository:
                 query,
                 {"r1": r1, "r2": r2, "head_rel": head_rel, "factual_only": factual_only},
             ).single()
+            if row is None:
+                return {"support": 0, "pca_denominator": 0, "head_count": 0}
+            return {
+                "support": int(row["support"]),
+                "pca_denominator": int(row["pca_denominator"]),
+                "head_count": int(row["head_count"]),
+            }
+
+    def compute_pattern_rule_metrics(
+        self,
+        body_rels: tuple[str, ...] | list[str],
+        head_rel: str,
+        factual_only: bool = True,
+    ) -> dict[str, int]:
+        pattern = self._build_body_match(body_rels)
+        head = head_rel.replace("`", "")
+        factual_head = "AND coalesce(h.is_inferred, false) = false" if factual_only else ""
+        factual_any = "AND coalesce(hh.is_inferred, false) = false" if factual_only else ""
+        query = f"""
+        CALL () {{
+          MATCH {pattern}
+          MATCH (x)-[h:`{head}`]->(y)
+          WHERE true {factual_head}
+          RETURN count(DISTINCT [x, y]) AS support
+        }}
+        CALL () {{
+          MATCH {pattern}
+          WITH DISTINCT x, y
+          WHERE EXISTS {{
+            MATCH (x)-[hh:`{head}`]->()
+            WHERE true {factual_any}
+          }}
+          RETURN count(DISTINCT [x, y]) AS pca_denominator
+        }}
+        CALL () {{
+          MATCH ()-[h:`{head}`]->()
+          WHERE true {factual_head}
+          RETURN count(DISTINCT [startNode(h), endNode(h)]) AS head_count
+        }}
+        RETURN support, pca_denominator, head_count
+        """
+        with self._driver.session(database=self._database) as session:
+            row = session.run(query, {"factual_only": factual_only}).single()
             if row is None:
                 return {"support": 0, "pca_denominator": 0, "head_count": 0}
             return {
@@ -474,7 +614,7 @@ class QueryRepository:
           MATCH ()-[h]->()
           WHERE type(h) = $head_rel
             AND ((NOT $factual_only) OR coalesce(h.is_inferred, false) = false)
-          RETURN count(h) AS head_count
+          RETURN count(DISTINCT [startNode(h), endNode(h)]) AS head_count
         }
         RETURN support, pca_denominator, head_count
         """
@@ -491,7 +631,42 @@ class QueryRepository:
                 "head_count": int(row["head_count"]),
             }
 
-    def apply_length2_rule(self, rule: Rule) -> int:
+    @staticmethod
+    def _negative_blocks(negative_relations: list[str] | None) -> str:
+        clauses = []
+        for rel in negative_relations or []:
+            token = rel.replace("`", "")
+            if not token:
+                continue
+            clauses.append(f"AND NOT EXISTS {{ MATCH (x)-[:`{token}`]->(y) }}")
+        return "\n        ".join(clauses)
+
+    def _apply_with_pattern(self, rule: Rule, negative_relations: list[str] | None = None) -> int:
+        match_pattern = self._build_body_match(rule.body_relations)
+        head_rel = rule.head_relation.replace("`", "")
+        blocked = self._negative_blocks(negative_relations)
+        query = f"""
+        MATCH {match_pattern}
+        WITH DISTINCT x, y
+        WHERE NOT EXISTS {{ MATCH (x)-[:`{head_rel}`]->(y) }}
+        {blocked}
+        MERGE (x)-[h:`{head_rel}`]->(y)
+        ON CREATE SET h.is_inferred = true,
+                      h.source_rule_id = $rule_id,
+                      h.rule_confidence = $confidence,
+                      h.inferred_at = datetime()
+        RETURN count(h) AS created_count
+        """
+        with self._driver.session(database=self._database) as session:
+            record = session.run(
+                query,
+                {"rule_id": rule.rule_id, "confidence": rule.pca_confidence},
+            ).single()
+            return int(record["created_count"]) if record else 0
+
+    def apply_length2_rule(self, rule: Rule, negative_relations: list[str] | None = None) -> int:
+        if any(not self._atom_is_plain(token) for token in rule.body_relations):
+            return self._apply_with_pattern(rule, negative_relations)
         body_r1 = rule.body_relations[0].replace("`", "")
         body_r2 = rule.body_relations[1].replace("`", "")
         head_r3 = rule.head_relation.replace("`", "")
@@ -500,6 +675,7 @@ class QueryRepository:
         MATCH (x)-[:`{body_r1}`]->(z)-[:`{body_r2}`]->(y)
         WITH DISTINCT x, y
         WHERE NOT EXISTS {{ MATCH (x)-[:`{head_r3}`]->(y) }}
+        {self._negative_blocks(negative_relations)}
         MERGE (x)-[h:`{head_r3}`]->(y)
         ON CREATE SET h.is_inferred = true,
                       h.source_rule_id = $rule_id,
@@ -514,7 +690,7 @@ class QueryRepository:
             ).single()
             return int(record["created_count"]) if record else 0
 
-    def apply_length3_rule(self, rule: Rule) -> int:
+    def apply_length3_rule(self, rule: Rule, negative_relations: list[str] | None = None) -> int:
         body_r1 = rule.body_relations[0].replace("`", "")
         body_r2 = rule.body_relations[1].replace("`", "")
         body_r3 = rule.body_relations[2].replace("`", "")
@@ -524,6 +700,7 @@ class QueryRepository:
         MATCH (x)-[:`{body_r1}`]->(m1)-[:`{body_r2}`]->(m2)-[:`{body_r3}`]->(y)
         WITH DISTINCT x, y
         WHERE NOT EXISTS {{ MATCH (x)-[:`{head_r4}`]->(y) }}
+        {self._negative_blocks(negative_relations)}
         MERGE (x)-[h:`{head_r4}`]->(y)
         ON CREATE SET h.is_inferred = true,
                       h.source_rule_id = $rule_id,
@@ -624,15 +801,43 @@ class QueryRepository:
     # ─── Generic length-N helpers ───────────────────────────────────
 
     @staticmethod
+    def _split_atom(token: str) -> tuple[bool, str, str | None]:
+        raw = token.replace("`", "")
+        inverse = raw.startswith("^")
+        if inverse:
+            raw = raw[1:]
+        const = None
+        if "@" in raw:
+            raw, const = raw.split("@", 1)
+        return inverse, raw, const
+
+    @staticmethod
+    def _atom_is_plain(token: str) -> bool:
+        return not token.startswith("^") and "@" not in token
+
+    @staticmethod
     def _build_body_match(body_rels: tuple[str, ...] | list[str]) -> str:
-        """Build MATCH pattern: (x)-[:`r1`]->(m1)-[:`r2`]->(m2)-...->(y)."""
+        """Build MATCH pattern: (x)-[:`r1`]->(m1)-[:`r2`]->(m2)-...->(y).
+
+        A leading ``^`` walks the relationship backward. ``rel@node`` binds the
+        hop target to that node id or elementId.
+        """
         n = len(body_rels)
         nodes = ["x"] + [f"m{i}" for i in range(1, n)] + ["y"]
         parts = [f"({nodes[0]})"]
-        for i in range(n):
-            escaped = body_rels[i].replace("`", "")
-            parts.append(f"-[:`{escaped}`]->({nodes[i + 1]})")
-        return "".join(parts)
+        wheres: list[str] = []
+        for i, token in enumerate(body_rels):
+            inverse, name, const = QueryRepository._split_atom(token)
+            hop = f"<-[:`{name}`]-" if inverse else f"-[:`{name}`]->"
+            parts.append(f"{hop}({nodes[i + 1]})")
+            if const is not None:
+                safe = const.replace("\\", "\\\\").replace("'", "\\'")
+                node = nodes[i + 1]
+                wheres.append(f"({node}.id = '{safe}' OR elementId({node}) = '{safe}')")
+        pattern = "".join(parts)
+        if wheres:
+            pattern += " WHERE " + " AND ".join(wheres)
+        return pattern
 
     @staticmethod
     def _build_body_match_vars(n: int) -> str:
@@ -706,7 +911,7 @@ class QueryRepository:
         CALL () {{
           MATCH ()-[h]->()
           WHERE type(h) = $head_rel {hf}
-          RETURN count(h) AS head_count
+          RETURN count(DISTINCT [startNode(h), endNode(h)]) AS head_count
         }}
         RETURN support, pca_denominator, head_count
         """
@@ -723,19 +928,53 @@ class QueryRepository:
                 "head_count": int(row["head_count"]),
             }
 
-    def apply_rule_generic(self, rule: Rule) -> int:
+    def retract_rule_edges(self, rule_id: str) -> int:
+        """Delete inferred edges written by one rule."""
+        query = """
+        MATCH ()-[h]->()
+        WHERE h.is_inferred = true AND h.source_rule_id = $rule_id
+        WITH collect(h) AS hs
+        FOREACH (rel IN hs | DELETE rel)
+        RETURN size(hs) AS removed
+        """
+        with self._driver.session(database=self._database) as session:
+            record = session.run(query, {"rule_id": rule_id}).single()
+            return int(record["removed"]) if record else 0
+
+    def retract_unsupported_rule(self, rule: Rule) -> int:
+        """Delete inferred edges of this rule whose body path is gone."""
+        n = len(rule.body_relations)
+        if n < 2:
+            return 0
+        match_pattern = self._build_body_match(rule.body_relations)
+        head_rel = rule.head_relation.replace("`", "")
+        query = f"""
+        MATCH (x)-[h:`{head_rel}`]->(y)
+        WHERE h.is_inferred = true AND h.source_rule_id = $rule_id
+          AND NOT EXISTS {{ MATCH {match_pattern} }}
+        WITH collect(h) AS hs
+        FOREACH (rel IN hs | DELETE rel)
+        RETURN size(hs) AS removed
+        """
+        with self._driver.session(database=self._database) as session:
+            record = session.run(query, {"rule_id": rule.rule_id}).single()
+            return int(record["removed"]) if record else 0
+
+    def apply_rule_generic(self, rule: Rule, negative_relations: list[str] | None = None) -> int:
         """Apply a rule of any body length."""
         n = len(rule.body_relations)
         if n == 2:
-            return self.apply_length2_rule(rule)
+            return self.apply_length2_rule(rule, negative_relations=negative_relations)
         if n == 3:
-            return self.apply_length3_rule(rule)
+            return self.apply_length3_rule(rule, negative_relations=negative_relations)
         match_pattern = self._build_body_match(rule.body_relations)
         head_rel = rule.head_relation.replace("`", "")
+        blocked = self._negative_blocks(negative_relations)
         query = f"""
         MATCH {match_pattern}
         WITH DISTINCT x, y
         WHERE NOT EXISTS {{ MATCH (x)-[:`{head_rel}`]->(y) }}
+        {blocked}
         MERGE (x)-[h:`{head_rel}`]->(y)
         ON CREATE SET h.is_inferred = true,
                       h.source_rule_id = $rule_id,
@@ -1101,5 +1340,69 @@ class QueryRepository:
         rows = session.run(
             query,
             {"node_keys": keys, "rel_types": rels, "factual_only": bool(factual_only)},
+        )
+        return {(str(row["src"]), str(row["rel"]), str(row["dst"])) for row in rows}
+
+    def lengthN_neighborhood_edges(
+        self,
+        body_rels: list[str],
+        head_rel: str,
+        node_keys: list[str],
+        factual_only: bool = True,
+        fanout_cap: int | None = None,
+    ) -> list[tuple[str, str, str]]:
+        """Neighborhood for a chain of any length. Seeds stay in every hop."""
+        keys = list(dict.fromkeys(key for key in node_keys if key))
+        if not keys or len(body_rels) < 2:
+            return []
+        cap = int(fanout_cap) if fanout_cap else None
+        with self._driver.session(database=self._database) as session:
+            frontier = list(keys)
+            sources = list(keys)
+            for rel in reversed(body_rels[:-1]):
+                incoming = self._lengthN_edges_entering(
+                    session, keys=frontier, rel_type=rel, factual_only=factual_only,
+                )
+                frontier = list(dict.fromkeys(src for src, _rel, _dst in incoming))
+                sources.extend(frontier)
+                if cap is not None and len(sources) >= cap:
+                    break
+            sources = list(dict.fromkeys(sources))[: cap or None]
+            edges: set[tuple[str, str, str]] = set()
+            hop_keys = list(sources)
+            for rel in body_rels:
+                batch = self._length3_edges_leaving(
+                    session, keys=list(dict.fromkeys([*hop_keys, *keys])),
+                    rel_types=[rel], factual_only=factual_only,
+                )
+                edges.update(batch)
+                hop_keys = [dst for _src, edge_rel, dst in batch if edge_rel == rel]
+                if cap is not None and len(edges) >= cap:
+                    break
+            edges.update(
+                self._length3_edges_leaving(
+                    session, keys=sources, rel_types=[head_rel], factual_only=factual_only,
+                )
+            )
+        if cap is not None:
+            return sorted(edges)[:cap]
+        return sorted(edges)
+
+    def _lengthN_edges_entering(self, session, *, keys, rel_type, factual_only):
+        if not keys:
+            return set()
+        query = """
+        UNWIND $node_keys AS key
+        MATCH (n) WHERE n.id = key OR elementId(n) = key
+        MATCH (m)-[e]->(n)
+        WHERE type(e) = $rel_type
+          AND ($factual_only = false OR coalesce(e.is_inferred, false) = false)
+        RETURN DISTINCT coalesce(m.id, elementId(m)) AS src,
+               type(e) AS rel,
+               coalesce(n.id, elementId(n)) AS dst
+        """
+        rows = session.run(
+            query,
+            {"node_keys": keys, "rel_type": rel_type, "factual_only": bool(factual_only)},
         )
         return {(str(row["src"]), str(row["rel"]), str(row["dst"])) for row in rows}

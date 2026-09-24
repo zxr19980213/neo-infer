@@ -70,7 +70,17 @@ parent(Z,X) ∧ parent(Z,Y) → sibling(X,Y)
 bornIn(X, beijing) ∧ locatedIn(beijing, Y) → nationality(X,Y)
 ```
 
-Search prunes with beam width, a per-head budget, and a confidence upper bound. `factual_only` (on by default) ignores edges this engine already inferred, so old conclusions cannot inflate the next round of statistics.
+Search prunes with beam width, a per-head budget, and a confidence upper bound. At weight 0 that bound is the exact support / PCA ratio; a higher weight only makes the bound more optimistic. `factual_only` (on by default) ignores edges this engine already inferred, so old conclusions cannot inflate the next round of statistics.
+
+## ⚡ What stays correct while the graph moves
+
+Most miners recount the whole graph, or apply rules one at a time and hope the writes do not step on each other. The current engine does three sharper things.
+
+**Deltas, not a second full scan.** After a batch lands, the previous graph is the current one with that batch undone. Support, PCA denominator, and head count move by the pairs that actually changed. The same arithmetic covers body length 2, 3, and longer chains, and it is checked against a full Cypher recount on a live Neo4j. One logical edge is one `(source, relation, target)` pair, so parallel relationships do not inflate head coverage.
+
+**Retract, then write.** Every selected rule drops the inferred edges its body no longer supports. Only after that pass do rules create edges. A second rule can therefore recreate a fact the first rule just released, and the edge’s `source_rule_id` names the rule that still holds it.
+
+**Deletes still have endpoints.** Creates are captured after the write. Deletes are captured in a before-phase trigger, while start, end, and `is_inferred` are still on the relationship. If an app removal omits that flag, the append path reads it from the edge while it is still there. Inferred training edges stay out of the next mining counts.
 
 ## 🚀 Quick start
 
@@ -160,8 +170,8 @@ graph TB
 | **Language** | Forward chains, inverse branches (`^`), and instantiated joins (`rel@nodeId`). |
 | **Inference** | One round, or fixpoint up to a max iteration. Every new edge names the rule that wrote it. |
 | **Lifecycle** | `discovered → adopted → applied`, and `reject` from any of those three. Applied is allowed to leave, and its edges go with it. |
-| **Incremental** | App changelog plus an optional APOC trigger. Length 2, 3, and longer bodies update from the event window. |
-| **Guards** | A negative relation blocks `MERGE`. Facts the body no longer supports are deleted before rules run again. |
+| **Incremental** | Changelog adds and removes update length 2, 3, and longer rules by the changed pairs. A missing baseline falls back to a full recount. |
+| **Guards** | A negative relation blocks `MERGE`. Unsupported edges are cleared for every rule before any rule writes again. |
 | **Surfaces** | REST, `neo-infer` CLI, and the `/console` UI. Schema indexes bootstrap on startup. |
 
 ## 🎛️ Mining knobs

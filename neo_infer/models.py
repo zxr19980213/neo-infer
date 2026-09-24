@@ -35,15 +35,21 @@ class Rule(BaseModel):
 
     @property
     def text(self) -> str:
-        if len(self.body_relations) == 2:
-            r1, r2 = self.body_relations
-            return f"{r1}(X,Z) ∧ {r2}(Z,Y) -> {self.head_relation}(X,Y)"
-
         middle_nodes = [f"Z{i}" for i in range(1, len(self.body_relations))]
         vars_chain = ["X", *middle_nodes, "Y"]
         atoms: list[str] = []
         for idx, rel in enumerate(self.body_relations):
-            atoms.append(f"{rel}({vars_chain[idx]},{vars_chain[idx + 1]})")
+            inverse = rel.startswith("^")
+            raw = rel[1:] if inverse else rel
+            const = None
+            if "@" in raw:
+                raw, const = raw.split("@", 1)
+            left, right = (vars_chain[idx + 1], vars_chain[idx]) if inverse else (vars_chain[idx], vars_chain[idx + 1])
+            if const is not None and not inverse:
+                right = const
+            elif const is not None and inverse:
+                left = const
+            atoms.append(f"{raw}({left},{right})")
         body_text = " ∧ ".join(atoms)
         return f"{body_text} -> {self.head_relation}(X,Y)"
 
@@ -60,6 +66,7 @@ class MineRulesRequest(BaseModel):
     confidence_ub_weight: float = Field(default=0.0, ge=0.0, le=1.0)
     body_length: int = Field(default=2, ge=2, le=5)
     changed_relations: list[str] | None = None
+    fanout_cap: int | None = Field(default=None, ge=10, le=20000)
 
 
 class MineRulesResponse(BaseModel):

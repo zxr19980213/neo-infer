@@ -171,8 +171,7 @@ def test_length2_redundancy_pruning_removes_same_support_specialization():
     miner = RuleMiningService(repo)  # type: ignore[arg-type]
     config = MiningConfig(min_support=2, min_pca_confidence=0.1, top_k=50, candidate_limit=100, body_length=2)
     rules = miner.mine_length2_rules(config)
-    # Redundancy pruning keeps only one specialization for the same prefix/support signature.
-    assert repo.length2_closing_pairs["pairs"] == [("bornIn", "locatedIn")]
+    assert repo.length2_closing_pairs["pairs"] == [("bornIn", "locatedIn"), ("bornIn", "locatedInX")]
     assert len(rules) == 1
 
 
@@ -367,4 +366,33 @@ def test_confidence_upper_bound_tightening_is_optional():
     baseline = miner._prune_low_confidence_upper_bound(candidates, min_confidence=0.2, confidence_ub_weight=0.0)
     tightened = miner._prune_low_confidence_upper_bound(candidates, min_confidence=0.2, confidence_ub_weight=1.0)
     assert len(baseline) == 1
-    assert len(tightened) == 0
+    assert len(tightened) == 1
+    assert tightened[0].body_relations == ("r1", "r2")
+
+
+def test_length2_mining_keeps_branch_and_constant_candidates():
+    class Repo(StubRepo):
+        def length2_body_candidates(self, limit: int = 5000, affected_relations: list[str] | None = None, **kwargs):
+            _ = (limit, affected_relations, kwargs)
+            return []
+
+        def length2_path_rule_candidates_for_bodies(self, body_pairs, limit: int = 5000, **kwargs):
+            _ = (body_pairs, limit, kwargs)
+            return []
+
+        def length2_extended_rule_candidates(self, limit: int = 5000, affected_relations=None, factual_only=True, min_support=1):
+            _ = (limit, affected_relations, factual_only, min_support)
+            return [
+                PathRuleCandidate(("^parent", "parent"), "sibling", 2, 2),
+                PathRuleCandidate(("bornIn@beijing", "locatedIn"), "nationality", 2, 2),
+            ]
+
+    rules = RuleMiningService(Repo()).mine_length2_rules(  # type: ignore[arg-type]
+        MiningConfig(min_support=2, min_pca_confidence=0.1, top_k=10, candidate_limit=20, body_length=2)
+    )
+    bodies = {rule.body_relations for rule in rules}
+    assert ("^parent", "parent") in bodies
+    assert ("bornIn@beijing", "locatedIn") in bodies
+    sibling = next(rule for rule in rules if rule.head_relation == "sibling")
+    assert "parent(Z1,X)" in sibling.text
+    assert "parent(Z1,Y)" in sibling.text

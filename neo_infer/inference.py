@@ -59,15 +59,46 @@ class InferenceEngine:
             )
         return total
 
+    def _negative_relations(self, rule) -> list[str]:
+        return sorted(self.conflict_rule_map.get(rule.head_relation, set()))
+
     def _apply_rule(self, rule) -> int:
+        negatives = self._negative_relations(rule)
         if hasattr(self.query_repo, "apply_rule_generic"):
-            return self.query_repo.apply_rule_generic(rule)
+            try:
+                return self.query_repo.apply_rule_generic(rule, negative_relations=negatives)
+            except TypeError:
+                return self.query_repo.apply_rule_generic(rule)
         body_len = self._body_length(rule)
         if body_len == 2:
-            return self.query_repo.apply_length2_rule(rule)
+            try:
+                return self.query_repo.apply_length2_rule(rule, negative_relations=negatives)
+            except TypeError:
+                return self.query_repo.apply_length2_rule(rule)
         if body_len == 3:
-            return self.query_repo.apply_length3_rule(rule)
+            try:
+                return self.query_repo.apply_length3_rule(rule, negative_relations=negatives)
+            except TypeError:
+                return self.query_repo.apply_length3_rule(rule)
         raise ValueError(f"Unsupported rule body length: {body_len}")
+
+    def _retract_rule(self, rule) -> int:
+        retract = getattr(self.query_repo, "retract_unsupported_rule", None)
+        if retract is None:
+            return 0
+        return int(retract(rule))
+
+    def _rules_to_apply(self, limit_rules: int):
+        adopted = self.rule_store.list_rules(status="adopted", limit=limit_rules)
+        applied = self.rule_store.list_rules(status="applied", limit=limit_rules)
+        merged = {rule.rule_id: rule for rule in [*adopted, *applied]}
+        return list(merged.values())[:limit_rules]
+
+    def _mark_applied(self, rule_id: str) -> None:
+        current = self.rule_store.get_rule_status(rule_id)
+        if current == "adopted":
+            self.rule_store.update_rule_status(rule_id, "applied")
+            self.rule_store.bump_rule_version(rule_id)
 
     def run_once(
         self,
@@ -76,15 +107,16 @@ class InferenceEngine:
     ) -> InferenceRunSummary:
         results: list[ApplyRuleResult] = []
         total_conflicts = 0
-        adopted_rules = self.rule_store.list_rules(status="adopted", limit=limit_rules)
+        adopted_rules = self._rules_to_apply(limit_rules)
+        for rule in adopted_rules:
+            self._retract_rule(rule)
         for rule in adopted_rules:
             conflicts = self._count_conflicts_for_rule(rule, check_conflicts=check_conflicts)
             self._persist_conflicts_for_rule(rule, iteration=1)
             created = self._apply_rule(rule)
             total_conflicts += conflicts
             if created > 0:
-                self.rule_store.update_rule_status(rule.rule_id, "applied")
-                self.rule_store.bump_rule_version(rule.rule_id)
+                self._mark_applied(rule.rule_id)
             results.append(
                 ApplyRuleResult(
                     rule_id=rule.rule_id,
@@ -103,13 +135,15 @@ class InferenceEngine:
     ) -> InferenceRunSummary:
         all_results: list[ApplyRuleResult] = []
         total_conflicts = 0
-        adopted_rules = self.rule_store.list_rules(status="adopted", limit=limit_rules)
+        adopted_rules = self._rules_to_apply(limit_rules)
         if not adopted_rules:
             return InferenceRunSummary(results=all_results, conflicts_detected=total_conflicts)
 
         rules_with_new_facts: set[str] = set()
         for iteration in range(1, max_iterations + 1):
             created_in_iteration = 0
+            for rule in adopted_rules:
+                self._retract_rule(rule)
             for rule in adopted_rules:
                 conflicts = self._count_conflicts_for_rule(rule, check_conflicts=check_conflicts)
                 self._persist_conflicts_for_rule(rule, iteration=iteration)
@@ -131,8 +165,7 @@ class InferenceEngine:
                 break
 
         for rule_id in rules_with_new_facts:
-            self.rule_store.update_rule_status(rule_id, "applied")
-            self.rule_store.bump_rule_version(rule_id)
+            self._mark_applied(rule_id)
         return InferenceRunSummary(results=all_results, conflicts_detected=total_conflicts)
 
     # Backward-compatible aliases.

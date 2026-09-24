@@ -8,7 +8,7 @@ from neo_infer.models import Rule
 VALID_TRANSITIONS: dict[str, set[str]] = {
     "discovered": {"adopted", "rejected"},
     "adopted": {"rejected", "applied"},
-    "applied": set(),
+    "applied": {"rejected"},
     "rejected": set(),
 }
 

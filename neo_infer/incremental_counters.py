@@ -151,3 +151,61 @@ def _triple_counts(
     support = len(body_pairs & head_pairs)
     pca = sum(1 for src, _dst in body_pairs if src in head_sources)
     return support, pca
+
+
+def length_n_stat_delta(
+    *,
+    body: list[str],
+    head: str,
+    present: set[Edge],
+    added: list[Edge],
+    removed: list[Edge],
+) -> tuple[int, int, int]:
+    """Event delta for a chain rule of any body length >= 2."""
+    if len(body) == 2:
+        return length2_stat_delta(
+            r1=body[0], r2=body[1], head=head, present=present, added=added, removed=removed,
+        )
+    if len(body) == 3:
+        return length3_stat_delta(
+            r1=body[0], r2=body[1], r3=body[2], head=head,
+            present=present, added=added, removed=removed,
+        )
+    present_rel, previous, added_in_graph, removed_set = _batch_states(
+        relevant={*body, head},
+        present=present,
+        added=added,
+        removed=removed,
+    )
+    support_now, pca_now = _chain_counts(present_rel, body, head)
+    support_prev, pca_prev = _chain_counts(previous, body, head)
+    return (
+        support_now - support_prev,
+        pca_now - pca_prev,
+        _head_delta(added_in_graph, removed_set, head),
+    )
+
+
+def _chain_counts(edges: set[Edge], body: list[str], head: str) -> tuple[int, int]:
+    by_src_rel: dict[tuple[str, str], list[Edge]] = defaultdict(list)
+    for edge in edges:
+        by_src_rel[(edge[1], edge[0])].append(edge)
+    body_pairs: set[tuple[str, str]] = set()
+
+    def walk(index: int, node: str, used: set[Edge], source: str) -> None:
+        if index == len(body):
+            body_pairs.add((source, node))
+            return
+        for edge in by_src_rel.get((body[index], node), ()):
+            if edge in used:
+                continue
+            walk(index + 1, edge[2], used | {edge}, source)
+
+    for edge in edges:
+        if edge[1] != body[0]:
+            continue
+        walk(1, edge[2], {edge}, edge[0])
+
+    head_pairs = {(src, dst) for src, rel, dst in edges if rel == head}
+    head_sources = {src for src, rel, _dst in edges if rel == head}
+    return len(body_pairs & head_pairs), sum(1 for src, _dst in body_pairs if src in head_sources)

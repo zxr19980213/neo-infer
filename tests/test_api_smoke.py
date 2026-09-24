@@ -892,7 +892,7 @@ def test_reject_adopted_succeeds(client_and_state):
     assert resp.json()["status"] == "rejected"
 
 
-def test_reject_applied_returns_409(client_and_state):
+def test_reject_applied_retracts_and_rejects(client_and_state):
     client, state = client_and_state
     client.post(
         "/rules/mine",
@@ -906,8 +906,8 @@ def test_reject_applied_returns_409(client_and_state):
     )
 
     resp = client.post(f"/rules/{rule_id}/reject")
-    assert resp.status_code == 409
-    assert resp.json()["detail"]["current_status"] == "applied"
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "rejected"
 
 
 def test_reject_already_rejected_returns_409(client_and_state):

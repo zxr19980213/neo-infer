@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from neo_infer.incremental_counters import length2_stat_delta, length3_stat_delta
+from neo_infer.incremental_counters import length2_stat_delta, length3_stat_delta, length_n_stat_delta
 from neo_infer.incremental_mining import IncrementalMiningService
 from neo_infer.models import ChangeEdge, DeltaBatch, MineRulesRequest, Rule
 
@@ -427,6 +427,24 @@ def test_length3_same_relation_on_three_body_atoms():
         head="region",
         present=present,
         added=[("china", "locatedIn", "asia")],
+        removed=[],
+    )
+    assert (support, pca, head) == (1, 1, 0)
+
+
+def test_length4_added_last_hop_completes_one_pair():
+    present = {
+        ("a", "r1", "b"),
+        ("b", "r2", "c"),
+        ("c", "r3", "d"),
+        ("d", "r4", "e"),
+        ("a", "head", "e"),
+    }
+    support, pca, head = length_n_stat_delta(
+        body=["r1", "r2", "r3", "r4"],
+        head="head",
+        present=present,
+        added=[("d", "r4", "e")],
         removed=[],
     )
     assert (support, pca, head) == (1, 1, 0)
